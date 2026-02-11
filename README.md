@@ -90,6 +90,37 @@ Edit `solution/cuda/kernel.cu` and `solution/cuda/binding.py` with your implemen
 
 ## Development Workflow
 
+### KernelForge Agent Loop (Triton-first)
+
+This repo now includes a minimal search loop under `kernelforge/`:
+
+```bash
+python engine.py --mode local --iters 10 --iterations 20 --num-trials 1
+```
+
+Core behavior:
+
+- Retrieves top-k local patterns from `kernelforge/rag_store/patterns.jsonl` + prior runs
+- Applies 1-2 constrained mutations (diff-based edits only)
+- Packs and benchmarks through existing starter-kit scripts
+- Caches benchmark outputs by kernel hash + benchmark flags
+- Logs full provenance to:
+  - `kernelforge/rag_store/runs.jsonl`
+  - `kernelforge/provenance/runs.jsonl`
+  - `kernelforge/provenance/latest_summary.json`
+
+Run on Modal B200:
+
+```bash
+python engine.py --mode modal --iters 10 --iterations 100 --num-trials 3
+```
+
+Optional: focus scoring on one workload during fast iteration:
+
+```bash
+python engine.py --mode local --iters 20 --workload-id <workload_uuid>
+```
+
 ### Pack Your Solution
 
 Generate `solution.json` from your source files:

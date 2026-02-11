@@ -18,12 +18,12 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-TRACE_SET_PATH = "/data"
+VOLUME_MOUNT = "/data"
+TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -31,51 +31,114 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
+def run_benchmark(solution_json: str, warmup_runs: int = 3, iterations: int = 100, num_trials: int = 5) -> dict:
+    """Run benchmark on Modal B200 and return results.
+
+    Runs everything IN-PROCESS to avoid IPC "header too large" errors
+    that occur when PersistentRunner/IsolatedRunner try to transfer
+    massive FP8 tensors between processes.
+    """
+    import traceback
+
+    import torch
+    from flashinfer_bench import BenchmarkConfig, Solution, TraceSet
+    from flashinfer_bench.bench.evaluators import resolve_evaluator
+    from flashinfer_bench.compile import get_builder_registry
+    from flashinfer_bench.data import EvaluationStatus
+
+    solution = Solution.model_validate_json(solution_json)
+    config = BenchmarkConfig(
+        warmup_runs=warmup_runs,
+        iterations=iterations,
+        num_trials=num_trials,
+    )
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
     if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+        raise ValueError(
+            f"Definition '{solution.definition}' not found in trace set. "
+            f"Available: {list(trace_set.definitions.keys())}"
+        )
 
     definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])
+    workload_traces = trace_set.workloads.get(solution.definition, [])
 
-    if not workloads:
+    if not workload_traces:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    bench_trace_set = TraceSet(
-        root=trace_set.root,
-        definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
-        workloads={definition.name: workloads},
-        traces={definition.name: []},
-    )
+    device = "cuda:0"
+    torch.cuda.set_device(0)
 
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+    # Build the solution once (compile / import the kernel)
+    registry = get_builder_registry()
+    try:
+        runnable = registry.build(definition, solution)
+    except Exception as e:
+        print(f"[run_modal] Build failed: {e}\n{traceback.format_exc()}")
+        return {definition.name: {}}
 
-    traces = result_trace_set.traces.get(definition.name, [])
+    evaluator_cls = resolve_evaluator(definition)
     results = {definition.name: {}}
 
-    for trace in traces:
-        if trace.evaluation:
+    for wl_trace in workload_traces:
+        wl = wl_trace.workload
+        uuid_short = wl.uuid[:8]
+
+        try:
+            # Build baseline (reference impl) — IN-PROCESS, no IPC
+            baseline = evaluator_cls.build_baseline(
+                defn=definition,
+                workload=wl,
+                cfg=config,
+                device=device,
+                traceset_root=Path(TRACE_SET_PATH),
+            )
+
+            # Evaluate the solution against the baseline — IN-PROCESS
+            evaluation = evaluator_cls.evaluate(
+                defn=definition,
+                sol_runnable=runnable,
+                inputs=baseline.inputs,
+                ref_outputs=baseline.outputs,
+                ref_mean_latency_ms=baseline.mean_latency_ms,
+                cfg=config,
+                log_path=f"/tmp/eval_{wl.uuid}.log",
+                device=device,
+            )
+
             entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
+                "status": evaluation.status.value,
+                "solution": solution.name,
             }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            results[definition.name][trace.workload.uuid] = entry
+            if evaluation.performance:
+                entry["latency_ms"] = evaluation.performance.latency_ms
+                entry["reference_latency_ms"] = evaluation.performance.reference_latency_ms
+                entry["speedup_factor"] = evaluation.performance.speedup_factor
+            if evaluation.correctness:
+                entry["max_abs_error"] = evaluation.correctness.max_absolute_error
+                entry["max_rel_error"] = evaluation.correctness.max_relative_error
+
+            results[definition.name][wl.uuid] = entry
+            status_str = evaluation.status.value
+            print(f"[run_modal] wl={uuid_short}: {status_str}", end="")
+            if evaluation.performance:
+                print(f" | {evaluation.performance.speedup_factor:.2f}x", end="")
+            print()
+
+        except Exception as e:
+            print(f"[run_modal] wl={uuid_short}: ERROR: {e}")
+            results[definition.name][wl.uuid] = {
+                "status": "runtime_error",
+                "solution": solution.name,
+                "error": str(e),
+            }
+
+    try:
+        runnable.close()
+    except Exception:
+        pass
 
     return results
 
@@ -110,12 +173,11 @@ def main():
     print("Packing solution from source files...")
     solution_path = pack_solution()
 
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+    print("\nLoading solution JSON...")
+    solution_json = solution_path.read_text(encoding="utf-8")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    results = run_benchmark.remote(solution_json)
 
     if not results:
         print("No results returned!")

@@ -3,8 +3,13 @@ Pack solution source files into solution.json.
 
 Reads configuration from config.toml and packs the appropriate source files
 (Triton or CUDA) into a Solution JSON file for submission.
+
+This version constructs the JSON manually so it works on macOS without
+triton/CUDA dependencies.  The JSON is validated by flashinfer_bench only
+inside the Modal container.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -17,9 +22,6 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
-
 
 def load_config() -> dict:
     """Load configuration from config.toml."""
@@ -31,8 +33,21 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
-def pack_solution(output_path: Path = None) -> Path:
-    """Pack solution files into a Solution JSON."""
+def _collect_sources(source_dir: Path) -> list[dict]:
+    """Recursively collect all source files under *source_dir*."""
+    sources: list[dict] = []
+    for p in sorted(source_dir.rglob("*")):
+        if p.is_file() and not p.name.startswith("."):
+            rel = p.relative_to(source_dir)
+            sources.append({
+                "path": str(rel),
+                "content": p.read_text(encoding="utf-8"),
+            })
+    return sources
+
+
+def pack_solution(output_path: Path | None = None) -> Path:
+    """Pack solution files into a Solution JSON (no flashinfer_bench needed)."""
     config = load_config()
 
     solution_config = config["solution"]
@@ -52,32 +67,44 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    # Create build spec
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-    )
+    sources = _collect_sources(source_dir)
+    if not sources:
+        raise ValueError(f"No source files found in {source_dir}")
 
-    # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
-        name=solution_config["name"],
-        definition=solution_config["definition"],
-        author=solution_config["author"],
-    )
+    # Build entry_point in the format flashinfer_bench expects:
+    #   "<relative_file>::<function_name>"
+    # If the user only specified the function name, prepend the first .py file.
+    if "::" not in entry_point:
+        py_files = [s["path"] for s in sources if s["path"].endswith(".py")]
+        if py_files:
+            entry_point = f"{py_files[0]}::{entry_point}"
+        else:
+            entry_point = f"{sources[0]['path']}::{entry_point}"
+
+    solution_dict = {
+        "name": solution_config["name"],
+        "definition": solution_config["definition"],
+        "author": solution_config["author"],
+        "spec": {
+            "language": language,
+            "target_hardware": ["cuda"],
+            "entry_point": entry_point,
+            "dependencies": [],
+        },
+        "sources": sources,
+    }
 
     # Write to output file
     if output_path is None:
         output_path = PROJECT_ROOT / "solution.json"
 
-    output_path.write_text(solution.model_dump_json(indent=2))
+    output_path.write_text(json.dumps(solution_dict, indent=2), encoding="utf-8")
     print(f"Solution packed: {output_path}")
-    print(f"  Name: {solution.name}")
-    print(f"  Definition: {solution.definition}")
-    print(f"  Author: {solution.author}")
+    print(f"  Name: {solution_dict['name']}")
+    print(f"  Definition: {solution_dict['definition']}")
+    print(f"  Author: {solution_dict['author']}")
     print(f"  Language: {language}")
+    print(f"  Entry: {entry_point}")
 
     return output_path
 
@@ -91,7 +118,7 @@ def main():
         "-o", "--output",
         type=Path,
         default=None,
-        help="Output path for solution.json (default: ./solution.json)"
+        help="Output path for solution.json (default: ./solution.json)",
     )
     args = parser.parse_args()
 
