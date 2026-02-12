@@ -1,5 +1,0 @@
-{"id":"triton_meta_tuning","mutations":["insert_meta_defaults"],"text":"Tune num_warps and num_stages conservatively for fused_moe kernels."}
-{"id":"block_sweep","mutations":["insert_block_m"],"text":"Sweep BLOCK_M values 64 128 256 and pick stable fast options."}
-{"id":"grid_clarity","mutations":["add_grid_helper"],"text":"Use explicit launch_grid helper to isolate launch geometry changes."}
-{"id":"jit_body_skeleton","mutations":["replace_pass_with_skeleton"],"text":"Replace pass statements with minimal valid Triton body to avoid empty kernels."}
-

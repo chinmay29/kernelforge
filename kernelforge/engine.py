@@ -42,13 +42,11 @@ def run_loop(
     cache_dir.mkdir(parents=True, exist_ok=True)
     prov_dir.mkdir(parents=True, exist_ok=True)
 
-    patterns_path = rag_dir / "patterns.jsonl"
     runs_path = rag_dir / "runs.jsonl"
     cache_path = cache_dir / "results.json"
     summary_path = prov_dir / "latest_summary.json"
 
-    rag = RagStore(patterns_path=patterns_path, runs_path=runs_path)
-    rag.bootstrap_patterns()
+    rag = RagStore(store_dir=rag_dir, runs_path=runs_path)
     proposer = Proposer(seed=seed)
     cache = load_json(cache_path, default={})
 
@@ -60,8 +58,13 @@ def run_loop(
     last_perf = ""
 
     for i in range(iters):
-        query = f"{cfg.definition} {last_error} {last_perf}"
-        retrieved = rag.retrieve(query=query, k=4)
+        # Use error-specific retrieval when previous iter had errors
+        if last_error:
+            retrieved = rag.get_error_fixes(last_error)
+        else:
+            query = f"{cfg.definition} {last_perf}"
+            tags = ["moe", "fp8", "blackwell"]
+            retrieved = rag.retrieve(query=query, k=6, tags=tags)
         proposal = proposer.propose(best_source, retrieved=retrieved, max_mutations=2)
 
         candidate_source = proposal.source
@@ -130,7 +133,7 @@ def run_loop(
             "retrieved": [r.get("id") for r in retrieved],
             "summary": bench_out["summary"],
         }
-        append_jsonl(runs_path, run_row)
+        rag.log_run(run_row)
         append_jsonl(prov_dir / "runs.jsonl", run_row)
 
     kernel_path.write_text(best_source, encoding="utf-8")
