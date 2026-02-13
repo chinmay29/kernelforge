@@ -73,11 +73,21 @@ def run_benchmark(solution_json: str, warmup_runs: int = 3, iterations: int = 10
 
     # Build the solution once (compile / import the kernel)
     registry = get_builder_registry()
+    build_error_detail = None
     try:
         runnable = registry.build(definition, solution)
     except Exception as e:
-        print(f"[run_modal] Build failed: {e}\n{traceback.format_exc()}")
-        return {definition.name: {}}
+        tb = traceback.format_exc()
+        print(f"[run_modal] Build failed: {e}\n{tb}")
+        build_error_detail = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": tb,
+        }
+        return {
+            definition.name: {},
+            "_build_error": build_error_detail  # Include detailed error
+        }
 
     evaluator_cls = resolve_evaluator(definition)
     results = {definition.name: {}}
@@ -128,11 +138,15 @@ def run_benchmark(solution_json: str, warmup_runs: int = 3, iterations: int = 10
             print()
 
         except Exception as e:
+            tb = traceback.format_exc()
             print(f"[run_modal] wl={uuid_short}: ERROR: {e}")
+            print(f"[run_modal] Full traceback:\n{tb}")
             results[definition.name][wl.uuid] = {
                 "status": "runtime_error",
                 "solution": solution.name,
                 "error": str(e),
+                "error_type": type(e).__name__,
+                "traceback": tb,  # Include full traceback
             }
 
     try:
