@@ -107,6 +107,25 @@ class FeedbackAgent(Agent):
                 ),
             )
 
+        if "seed_stage_numerics" in error.lower():
+            return Feedback(
+                analysis=(
+                    "The seed-stage GEMM1 helper already receives dequantized float32 "
+                    "activations and weights, so the previous attempt lost accuracy by "
+                    "downcasting the GEMM operands too early."
+                ),
+                fix_instructions=(
+                    "Keep `_gemm1_tile_kernel` operands in fp32 for the first correctness "
+                    "pass. Do not cast `a` or `w` to bf16/fp16 before the dot. Use "
+                    "`tl.dot(a, w, input_precision=\"ieee\")` or equivalent fp32 accumulation."
+                ),
+                code_example=(
+                    "a = tl.load(a_ptrs, mask=..., other=0.0)\n"
+                    "w = tl.load(w_ptrs, mask=..., other=0.0)\n"
+                    "acc += tl.dot(a, w, input_precision=\"ieee\")"
+                ),
+            )
+
         if "incorrect_numerical" in error.lower() or "max_abs_error" in error.lower():
             return Feedback(
                 analysis=(
@@ -126,14 +145,40 @@ class FeedbackAgent(Agent):
                 ),
             )
 
+        if "seed_stage_scope" in error.lower() or "_gemm1_tile_kernel" in error:
+            return Feedback(
+                analysis=(
+                    "The seed-stage Tritonization scope was violated. The first Triton step "
+                    "must only replace the GEMM1 helper with the vetted micro-kernel template."
+                ),
+                fix_instructions=(
+                    "Use exactly one `@triton.jit` kernel named `_gemm1_tile_kernel`, "
+                    "launch it from `_gemm1_subpath(...)`, and keep routing, SwiGLU, GEMM2, "
+                    "and `accum.index_add_` unchanged in PyTorch."
+                ),
+                code_example=(
+                    "@triton.jit\n"
+                    "def _gemm1_tile_kernel(...):\n"
+                    "    ...\n\n"
+                    "def _gemm1_subpath(A_e, W13_e):\n"
+                    "    out = torch.empty(...)\n"
+                    "    _gemm1_tile_kernel[grid](...)\n"
+                    "    return out"
+                ),
+            )
+
         if stage == "generator":
             return Feedback(
                 analysis="The generator response format or parse failed, so no valid source was produced.",
                 fix_instructions=(
-                    "Return strict JSON with keys reasoning, mutation_name, source. "
-                    "Do not wrap JSON in prose. Ensure source contains the full kernel.py file."
+                    "Return strict JSON with keys reasoning, mutation_name, patch. "
+                    "Use SEARCH/REPLACE blocks in `patch`, do not wrap JSON in prose, "
+                    "and fall back to full-file `source` only if patching is impossible."
                 ),
-                code_example='{"reasoning": "...", "mutation_name": "retry_fix", "source": "import torch\\n..."}',
+                code_example=(
+                    '{"reasoning": "...", "mutation_name": "retry_fix", '
+                    '"patch": "<<<<<<< SEARCH\\nold\\n=======\\nnew\\n>>>>>>> REPLACE"}'
+                ),
             )
 
         first_failure = report.get("first_failure") or {}

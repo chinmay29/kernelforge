@@ -6,3 +6,4 @@ author = "team-name"              # Team/author name
 [build]
 language = "triton"               # triton | cuda
 entry_point = "kernel"            # Kernel function name
+destination_passing_style = false # current seed kernel returns an output tensor

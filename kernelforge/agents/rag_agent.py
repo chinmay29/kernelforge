@@ -51,6 +51,7 @@ class RagAgent(Agent):
 
         try:
             candidates: list[dict[str, Any]] = []
+            candidates.extend(self._seed_stage_guardrails(source))
             candidates.extend(self._hard_guardrails(last_error))
 
             # Keep seed retrieval useful: drop low-signal run-history rows first.
@@ -93,6 +94,28 @@ class RagAgent(Agent):
             return AgentResult(ok=False, error=f"RAG retrieval failed: {exc}")
 
     @staticmethod
+    def _seed_stage_guardrails(source: str) -> list[dict[str, Any]]:
+        if "def _gemm1_subpath(" not in source or "@triton.jit" in source:
+            return []
+        return [
+            {
+                "id": "guard::seed_gemm1_fp32_ieee",
+                "category": "guardrail",
+                "text": (
+                    "Seed-stage `_gemm1_subpath(...)` already receives dequantized fp32 "
+                    "tensors (`A_e`, `W13_e`). Keep the first Triton GEMM1 attempt in fp32 "
+                    "instead of downcasting to bf16/fp16."
+                ),
+                "code_hint": (
+                    "a = tl.load(a_ptrs, mask=..., other=0.0)\n"
+                    "w = tl.load(w_ptrs, mask=..., other=0.0)\n"
+                    "acc += tl.dot(a, w, input_precision=\"ieee\")"
+                ),
+                "constraint": "Seed GEMM1 numerics should stay fp32-faithful on the first correctness pass.",
+            }
+        ]
+
+    @staticmethod
     def _hard_guardrails(last_error: str) -> list[dict[str, Any]]:
         """Always inject critical runtime/correctness guardrails."""
         rows: list[dict[str, Any]] = [
@@ -100,14 +123,16 @@ class RagAgent(Agent):
                 "id": "guard::fp8_pre_dot_dequant",
                 "category": "guardrail",
                 "text": (
-                    "FP8 dequantization must happen before tl.dot; avoid bf16/fp16 * fp32 "
-                    "promotion leaks by explicit recast."
+                    "FP8 dequantization must happen before tl.dot. Do not feed raw FP8 "
+                    "operands into tl.dot; if a helper already receives dequantized fp32 "
+                    "tensors, keep them fp32 for the first correctness pass."
                 ),
                 "code_hint": (
-                    "a_fp16 = (a.to(tl.float16) * a_scale[:, None]).to(tl.float16); "
-                    "acc += tl.dot(a_fp16, w_fp16)"
+                    "a = tl.load(a_ptrs, mask=..., other=0.0)\n"
+                    "w = tl.load(w_ptrs, mask=..., other=0.0)\n"
+                    "acc += tl.dot(a, w, input_precision=\"ieee\")"
                 ),
-                "constraint": "No fp32 operands inside tl.dot()",
+                "constraint": "No raw FP8 operands inside tl.dot(); dequantized fp32 helpers may stay fp32.",
             },
             {
                 "id": "guard::n_tail_load_mask",

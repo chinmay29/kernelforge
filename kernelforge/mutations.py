@@ -117,3 +117,36 @@ def apply_mutation(name: str, source: str, rng: random.Random) -> MutationResult
     new_source, params = MUTATION_REGISTRY[name](source, rng)
     return _with_diff(name, source, new_source, params)
 
+
+_PATCH_BLOCK_RE = re.compile(
+    r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE",
+    re.DOTALL,
+)
+
+
+def llm_patch_edit(source: str, patch_text: str) -> MutationResult:
+    """Apply an LLM-provided SEARCH/REPLACE patch and return a diffed mutation."""
+    patch = patch_text.strip()
+    if patch.startswith("```"):
+        lines = patch.splitlines()
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            patch = "\n".join(lines[1:-1]).strip()
+
+    matches = list(_PATCH_BLOCK_RE.finditer(patch))
+    if not matches:
+        raise ValueError("No SEARCH/REPLACE blocks found in patch text.")
+
+    updated = source
+    for match in matches:
+        search = match.group(1)
+        replace = match.group(2)
+        if search not in updated:
+            raise ValueError("SEARCH block not found in source.")
+        updated = updated.replace(search, replace, 1)
+
+    return _with_diff(
+        "llm_patch_edit",
+        source,
+        updated,
+        {"patch_blocks": len(matches)},
+    )

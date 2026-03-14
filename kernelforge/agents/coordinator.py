@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +43,7 @@ class CoordinatorAgent:
         rag_store: Any,
         log_dir: Path | None = None,
         model: str = "claude-sonnet-4-5-20250929",
-        max_attempts: int = 3,
+        max_attempts: int = 4,
         verbose: bool = True,
     ) -> None:
         self.rng = random.Random(seed)
@@ -70,8 +71,13 @@ class CoordinatorAgent:
         del max_mutations  # Coordinator currently emits a single focused mutation.
 
         retrieved = retrieved or []
-        task_instruction = self._task_instruction(last_error)
+        task_instruction = self._task_instruction(source, last_error)
         attempt_error = self._detailed_error(last_error)
+        correctness_mode = (
+            "incorrect_numerical" in attempt_error.lower()
+            or "max_abs_error" in attempt_error.lower()
+            or "correctness_error" in attempt_error.lower()
+        )
         feedback: dict[str, Any] = {}
         previous_generated = ""
         iter_start = time.perf_counter()
@@ -156,6 +162,76 @@ class CoordinatorAgent:
                 continue
 
             generated_source = str(gen_result.data.get("source", ""))
+            patch_text = str(gen_result.data.get("patch", ""))
+            if patch_text.strip():
+                try:
+                    generated_source = _apply_search_replace_patch(source, patch_text)
+                    attempt_trace["patch_mode"] = "search_replace"
+                except Exception as exc:
+                    self._print(f"         Patch apply failed: {str(exc)[:140]}")
+                    self._print("      -> Feedback agent")
+                    feedback = self.feedback_agent.run(
+                        {
+                            "stage": "generator",
+                            "error": f"Patch apply failed: {exc}",
+                            "attempt": attempt,
+                            "report": {"patch": patch_text[:8000]},
+                        }
+                    ).data
+                    attempt_error = f"Patch apply failed: {exc}"
+                    attempt_trace["feedback"] = feedback
+                    attempt_trace["timings_sec"]["attempt_total"] = round(
+                        time.perf_counter() - attempt_start, 4
+                    )
+                    self._print("         Attempt failed at patch-apply stage")
+                    iter_trace["attempts"].append(attempt_trace)
+                    self._log_attempt(attempt, gen_result.data, attempt_trace)
+                    continue
+            elif not generated_source.strip():
+                self._print("      -> Feedback agent")
+                feedback = self.feedback_agent.run(
+                    {
+                        "stage": "generator",
+                        "error": "Attempt did not return a patch.",
+                        "attempt": attempt,
+                        "report": {},
+                    }
+                ).data
+                attempt_error = "Attempt did not return a patch."
+                attempt_trace["feedback"] = feedback
+                attempt_trace["timings_sec"]["attempt_total"] = round(
+                    time.perf_counter() - attempt_start, 4
+                )
+                self._print("         Attempt failed at patch-apply stage")
+                iter_trace["attempts"].append(attempt_trace)
+                self._log_attempt(attempt, gen_result.data, attempt_trace)
+                continue
+
+            if correctness_mode and _is_tuning_only_change(source, generated_source):
+                self._print("      -> Feedback agent")
+                feedback = self.feedback_agent.run(
+                    {
+                        "stage": "generator",
+                        "error": (
+                            "Previous run failed correctness, but patch is tuning-only "
+                            "(tiles/warps/stages) without semantic/indexing fixes."
+                        ),
+                        "attempt": attempt,
+                        "report": {},
+                    }
+                ).data
+                attempt_error = (
+                    "Correctness failed previously; apply semantic fix "
+                    "(token/pair indexing, expert/block mapping, masking) before tuning."
+                )
+                attempt_trace["feedback"] = feedback
+                attempt_trace["timings_sec"]["attempt_total"] = round(
+                    time.perf_counter() - attempt_start, 4
+                )
+                self._print("         Attempt rejected: tuning-only change under correctness failure")
+                iter_trace["attempts"].append(attempt_trace)
+                self._log_attempt(attempt, gen_result.data, attempt_trace)
+                continue
             previous_generated = generated_source
 
             t0 = time.perf_counter()
@@ -191,7 +267,12 @@ class CoordinatorAgent:
 
             t0 = time.perf_counter()
             self._print("      -> Validation agent")
-            validation_result = self.validation_agent.run({"source": generated_source})
+            validation_result = self.validation_agent.run(
+                {
+                    "source": generated_source,
+                    "baseline_source": source,
+                }
+            )
             attempt_trace["timings_sec"]["validation"] = round(time.perf_counter() - t0, 4)
             attempt_trace["validation"] = validation_result.data
             if validation_result.ok:
@@ -354,8 +435,26 @@ class CoordinatorAgent:
             self._run_history[-1]["status_summary"] = summary.get("status_summary", "")
             self._run_history[-1]["error"] = error
 
-    def _task_instruction(self, last_error: str) -> str:
+    def _task_instruction(self, source: str, last_error: str) -> str:
         lowered = last_error.lower()
+        if "def _gemm1_subpath(" in source and "@triton.jit" not in source and not last_error:
+            return (
+                "Use the vetted GEMM1-only Triton micro-kernel template. Replace only "
+                "`_gemm1_subpath(...)`; keep routing, SwiGLU, GEMM2, and final index_add_ "
+                "in PyTorch. Do not introduce more than one @triton.jit kernel in this attempt."
+            )
+        if (
+            "def _gemm1_subpath(" in source
+            and "@triton.jit" not in source
+            and ("incorrect_numerical" in lowered or "max_abs_error" in lowered)
+        ):
+            return (
+                "Fix only the seed-stage GEMM1 micro-kernel numerics. `_gemm1_subpath(...)` "
+                "already receives dequantized float32 tensors (`A_e`, `W13_e`), so do not "
+                "downcast them to bf16/fp16. Keep the Triton GEMM1 math in fp32 and use "
+                "`tl.dot(..., input_precision=\"ieee\")` or equivalent fp32 accumulation. "
+                "Keep routing, SwiGLU, GEMM2, and index_add_ unchanged in PyTorch."
+            )
         if (
             "operation not supported on global/shared address space" in lowered
             or "acceleratorerror" in lowered
@@ -416,6 +515,7 @@ class CoordinatorAgent:
             user_prompt = str(generator_data.get("user_prompt", ""))
             raw_response = str(generator_data.get("raw_response", ""))
             generated_source = str(generator_data.get("source", ""))
+            patch_text = str(generator_data.get("patch", ""))
 
             if system_prompt:
                 (iter_dir / "generator_system_prompt.txt").write_text(system_prompt, encoding="utf-8")
@@ -423,6 +523,8 @@ class CoordinatorAgent:
                 (iter_dir / "generator_user_prompt.txt").write_text(user_prompt, encoding="utf-8")
             if raw_response:
                 (iter_dir / "generator_raw_response.txt").write_text(raw_response, encoding="utf-8")
+            if patch_text:
+                (iter_dir / "generator_patch.txt").write_text(patch_text, encoding="utf-8")
             if generated_source:
                 (iter_dir / "generated_kernel.py").write_text(generated_source, encoding="utf-8")
 
@@ -460,3 +562,90 @@ def _make_diff(old: str, new: str) -> str:
             lineterm="",
         )
     )
+
+
+_PATCH_BLOCK_RE = re.compile(
+    r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE",
+    re.DOTALL,
+)
+
+
+def _strip_code_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def _apply_search_replace_patch(source: str, patch_text: str) -> str:
+    patch = _strip_code_fences(patch_text).replace("\r\n", "\n")
+    matches = list(_PATCH_BLOCK_RE.finditer(patch))
+    if not matches:
+        raise ValueError("no SEARCH/REPLACE blocks found")
+
+    updated = source
+    for match in matches:
+        search = match.group(1)
+        replace = match.group(2)
+        if search not in updated:
+            raise ValueError("SEARCH block not found in baseline source")
+        updated = updated.replace(search, replace, 1)
+    return updated
+
+
+def _is_tuning_only_change(old: str, new: str) -> bool:
+    if old == new:
+        return True
+    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm=""))
+    changed_lines = [
+        line[1:]
+        for line in diff
+        if line and line[0] in {"+", "-"} and not line.startswith(("+++", "---"))
+    ]
+    if not changed_lines:
+        return True
+
+    semantic_markers = {
+        "sorted_tokens",
+        "expert_ids_per_block",
+        "token_mask",
+        "offs_token",
+        "offs_token_id",
+        "num_tokens_post_padded",
+        "index_add_",
+        "routing_weights",
+        "topk_idx",
+        "weights =",
+        "expert_to_tokens",
+        "packed_tokens",
+    }
+    for line in changed_lines:
+        lower = line.lower()
+        if any(marker.lower() in lower for marker in semantic_markers):
+            return False
+
+    tuning_markers = (
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "DEFAULT_NUM_WARPS",
+        "DEFAULT_NUM_STAGES",
+    )
+    for line in changed_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if any(marker in stripped for marker in tuning_markers):
+            continue
+        # Any non-marker code line is likely semantic enough.
+        if "=" in stripped or "(" in stripped or ")" in stripped:
+            return False
+    return True

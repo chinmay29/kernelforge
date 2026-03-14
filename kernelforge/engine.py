@@ -8,7 +8,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from kernelforge.benchmark import BenchSettings, kernel_hash, make_cache_key, run_benchmark
+from kernelforge.benchmark import (
+    BenchSettings,
+    PreflightSettings,
+    kernel_hash,
+    make_cache_key,
+    run_benchmark,
+    run_preflight,
+)
 from kernelforge.config import load_project_config
 from kernelforge.io_utils import append_jsonl, dump_json, load_json
 from kernelforge.agents import CoordinatorAgent
@@ -17,6 +24,24 @@ from kernelforge.rag import RagStore
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _preflight_failure_result(preflight_out: dict[str, Any]) -> dict[str, Any]:
+    failed_stage = str(preflight_out.get("failed_stage", "unknown"))
+    status = f"preflight_failed:{failed_stage}"
+    return {
+        "results": preflight_out.get("results", {}),
+        "summary": {
+            "total_workloads": 0,
+            "success_count": 0,
+            "status_summary": status,
+            "median_speedup": None,
+            "median_latency_ms": None,
+            "max_abs_error": None,
+            "score": -1e12,
+        },
+        "preflight": preflight_out,
+    }
 
 
 def run_loop(
@@ -28,6 +53,13 @@ def run_loop(
     iterations: int,
     num_trials: int,
     workload_focus: str | None,
+    preflight_enabled: bool = True,
+    preflight_quick_workloads: int = 3,
+    preflight_sanitizer_workloads: int = 1,
+    preflight_run_sanitizer: bool = True,
+    preflight_sanitizer_types: list[str] | None = None,
+    autofix_correctness_only: bool = False,
+    llm_model: str = "claude-sonnet-4-5-20250929",
 ) -> dict[str, Any]:
     cfg = load_project_config(project_root)
     kernel_path = cfg.kernel_path
@@ -49,8 +81,26 @@ def run_loop(
     rag = RagStore(store_dir=rag_dir, runs_path=runs_path)
     llm_log_dir = prov_dir / "llm_logs"
     llm_log_dir.mkdir(parents=True, exist_ok=True)
-    coordinator = CoordinatorAgent(seed=seed, rag_store=rag, log_dir=llm_log_dir)
+    coordinator = CoordinatorAgent(
+        seed=seed,
+        rag_store=rag,
+        log_dir=llm_log_dir,
+        model=llm_model,
+    )
     cache = load_json(cache_path, default={})
+
+    preflight_settings = PreflightSettings(
+        enabled=preflight_enabled,
+        quick_workloads=max(1, int(preflight_quick_workloads)),
+        quick_warmup_runs=1,
+        quick_iterations=1,
+        quick_num_trials=1,
+        run_sanitizer=preflight_run_sanitizer,
+        sanitizer_workloads=max(1, int(preflight_sanitizer_workloads)),
+        sanitizer_timeout=300,
+        sanitizer_types=tuple(preflight_sanitizer_types or ["memcheck"]),
+        fail_on_sanitizer_error=True,
+    )
 
     best_source = kernel_path.read_text(encoding="utf-8")
     best_hash = kernel_hash(best_source)
@@ -65,7 +115,7 @@ def run_loop(
         print(f"{'='*60}")
 
         # Use error-specific retrieval when previous iter had errors
-        print(f"  📚 [1/4] Seed RAG retrieval...", end=" ", flush=True)
+        print(f"  📚 [1/5] Seed RAG retrieval...", end=" ", flush=True)
         if last_error:
             retrieved = rag.get_error_fixes(last_error)
             print(f"error-mode ({len(retrieved)} fixes)")
@@ -75,7 +125,7 @@ def run_loop(
             retrieved = rag.retrieve(query=query, k=6, tags=tags)
             print(f"ok ({len(retrieved)} entries)")
 
-        print(f"  🤖 [2/4] Multi-agent generation/validation (LLM + checks)...", flush=True)
+        print(f"  🤖 [2/5] Multi-agent generation/validation (LLM + checks)...", flush=True)
         proposal = coordinator.propose(
             best_source,
             retrieved=retrieved,
@@ -94,6 +144,7 @@ def run_loop(
         proposal_failed = all(
             m.name.startswith("multi_agent_failed_iter_") for m in proposal.mutations
         )
+        preflight_passed_this_iter = False
         if proposal_failed:
             print("         ⚠️  Proposal failed validation/constraints; skipping benchmark for this iteration.")
             bench_out = {
@@ -118,16 +169,67 @@ def run_loop(
                 num_trials=num_trials,
                 workload_focus=workload_focus,
             )
-            key = make_cache_key(candidate_hash, settings)
+            key = make_cache_key(
+                candidate_hash,
+                settings,
+                extra=(
+                    f"{preflight_settings.cache_tag()}|autofix={int(autofix_correctness_only)}"
+                ),
+            )
             error = ""
             from_cache = key in cache
             if from_cache:
-                print(f"  📦 [3/4] Benchmark (cached)")
+                print(f"  📦 [3/5] Benchmark (cached)")
                 bench_out = cache[key]
             else:
-                print(f"  🚀 [3/4] Benchmark on {mode} (19 workloads, ~3 min)...", flush=True)
+                preflight_out: dict[str, Any] = {
+                    "ok": True,
+                    "status_summary": "preflight_disabled",
+                    "stages": [],
+                }
                 try:
-                    bench_out = run_benchmark(settings)
+                    if preflight_settings.enabled:
+                        print("  🧪 [3/5] Preflight: compile -> quick correctness -> sanitizer...", flush=True)
+                        preflight_out = run_preflight(settings, preflight_settings)
+                        if not preflight_out.get("ok", False):
+                            failed_stage = str(preflight_out.get("failed_stage", "unknown"))
+                            error = str(preflight_out.get("error", "preflight failed"))
+                            print(f"         ❌ Preflight failed at {failed_stage}: {error[:120]}")
+                            details = preflight_out.get("failure_details") or []
+                            if details:
+                                first = details[0]
+                                print(
+                                    "         ↪ detail:"
+                                    f" workload={first.get('workload_id')}"
+                                    f" status={first.get('status')}"
+                                    f" max_abs={first.get('max_abs_error')}"
+                                    f" max_rel={first.get('max_rel_error')}"
+                                )
+                            bench_out = _preflight_failure_result(preflight_out)
+                        else:
+                            print("         ✅ Preflight passed")
+                            preflight_passed_this_iter = True
+
+                    if not preflight_settings.enabled or preflight_out.get("ok", False):
+                        if autofix_correctness_only:
+                            print("  ⏭️  [4/5] Autofix mode: skipping full benchmark after preflight pass.")
+                            bench_out = {
+                                "results": {},
+                                "summary": {
+                                    "total_workloads": 0,
+                                    "success_count": 0,
+                                    "status_summary": "preflight_passed",
+                                    "median_speedup": None,
+                                    "median_latency_ms": None,
+                                    "max_abs_error": None,
+                                    "score": 0.0,
+                                },
+                                "preflight": preflight_out,
+                            }
+                        else:
+                            print(f"  🚀 [4/5] Full benchmark on {mode} (19 workloads, ~3 min)...", flush=True)
+                            bench_out = run_benchmark(settings, phase="full")
+                            bench_out["preflight"] = preflight_out
                 except Exception as exc:
                     error = str(exc)
                     print(f"         ❌ Benchmark error: {error[:100]}")
@@ -141,6 +243,12 @@ def run_loop(
                             "median_latency_ms": None,
                             "max_abs_error": None,
                             "score": -1e12,
+                        },
+                        "preflight": {
+                            "ok": False,
+                            "status_summary": "preflight_exception",
+                            "error": error,
+                            "stages": [],
                         },
                     }
                 cache[key] = bench_out
@@ -160,9 +268,14 @@ def run_loop(
             "compilation_error",
             "incorrect_numerical",
             "correctness_error",
+            "sanitizer_error",
         }
-        for workloads in bench_out.get("results", {}).values():
+        for def_name, workloads in bench_out.get("results", {}).items():
+            if str(def_name).startswith("_") or not isinstance(workloads, dict):
+                continue
             for wl_id, row in workloads.items():
+                if not isinstance(row, dict):
+                    continue
                 wl_status = str(row.get("status", "")).lower()
                 wl_error = row.get("error", "")
                 if wl_status in error_statuses:
@@ -189,13 +302,14 @@ def run_loop(
         # Check for build errors
         if "_build_error" in bench_out.get("results", {}):
             build_err = bench_out["results"]["_build_error"]
-            detailed_error_info = {
-                "error": build_err.get("error_message", ""),
-                "error_type": build_err.get("error_type", "BuildError"),
-                "traceback": build_err.get("traceback", ""),
-                "workload_id": "build",
-                "status": "build_error",
-            }
+            if isinstance(build_err, dict):
+                detailed_error_info = {
+                    "error": build_err.get("error_message", ""),
+                    "error_type": build_err.get("error_type", "BuildError"),
+                    "traceback": build_err.get("traceback", ""),
+                    "workload_id": "build",
+                    "status": "build_error",
+                }
 
         # Save detailed error to file for next iteration
         if detailed_error_info:
@@ -217,7 +331,7 @@ def run_loop(
         if len(workload_errors) > 1:
             print(f"         ({len(workload_errors)} unique workload errors total)")
 
-        print(f"  📊 [4/4] Results:")
+        print(f"  📊 [5/5] Results:")
         print(f"         Score: {score:.4f}")
         print(f"         Speedup: {med_speedup}")
         print(f"         Status: {status_summary}")
@@ -252,10 +366,15 @@ def run_loop(
             "reasoning": proposal.reasoning,
             "retrieved": [r.get("id") for r in retrieved],
             "summary": bench_out["summary"],
+            "preflight": bench_out.get("preflight"),
         }
         rag.log_run(run_row)
         append_jsonl(prov_dir / "runs.jsonl", run_row)
         coordinator.update_last_run(score=score, summary=bench_out["summary"], error=error)
+
+        if autofix_correctness_only and preflight_passed_this_iter:
+            print("         ✅ Autofix target met: preflight passed. Stopping early.")
+            break
 
     print(f"\n{'='*60}")
     print(f"  ✅ DONE — {iters} iterations complete")
@@ -281,14 +400,39 @@ def run_loop(
 def main() -> None:
     parser = argparse.ArgumentParser(description="KernelForge optimization loop")
     parser.add_argument("--mode", choices=["local", "modal"], default="local")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="claude-sonnet-4-5-20250929",
+        help="Anthropic model id used by the generator agent.",
+    )
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--num-trials", type=int, default=1)
     parser.add_argument("--workload-id", type=str, default=None)
+    parser.add_argument("--no-preflight", action="store_true")
+    parser.add_argument("--preflight-quick-workloads", type=int, default=3)
+    parser.add_argument("--preflight-sanitizer-workloads", type=int, default=1)
+    parser.add_argument("--skip-preflight-sanitizer", action="store_true")
+    parser.add_argument(
+        "--autofix-correctness",
+        action="store_true",
+        help="Run iterative fix loop with preflight gating and stop once preflight passes (skips full benchmark).",
+    )
+    parser.add_argument(
+        "--preflight-sanitizer-types",
+        type=str,
+        default="memcheck",
+        help="Comma-separated sanitizer checks (e.g. memcheck,racecheck,synccheck,initcheck).",
+    )
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     args = parser.parse_args()
+
+    sanitizer_types = [
+        t.strip() for t in args.preflight_sanitizer_types.split(",") if t.strip()
+    ] or ["memcheck"]
 
     result = run_loop(
         project_root=args.project_root.resolve(),
@@ -299,6 +443,13 @@ def main() -> None:
         iterations=args.iterations,
         num_trials=args.num_trials,
         workload_focus=args.workload_id,
+        preflight_enabled=not args.no_preflight,
+        preflight_quick_workloads=args.preflight_quick_workloads,
+        preflight_sanitizer_workloads=args.preflight_sanitizer_workloads,
+        preflight_run_sanitizer=not args.skip_preflight_sanitizer,
+        preflight_sanitizer_types=sanitizer_types,
+        autofix_correctness_only=args.autofix_correctness,
+        llm_model=args.model,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

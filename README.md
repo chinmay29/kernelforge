@@ -78,6 +78,7 @@ author = "team-name"              # Team/author name
 [build]
 language = "triton"               # triton | cuda
 entry_point = "kernel"            # Kernel function name
+destination_passing_style = false # set false for value-returning kernels
 ```
 
 ### 5. Implement Your Kernel
@@ -100,10 +101,14 @@ python engine.py --mode local --iters 10 --iterations 20 --num-trials 1
 
 Core behavior:
 
-- Retrieves top-k local patterns from `kernelforge/rag_store/patterns.jsonl` + prior runs
+- Retrieves top-k local patterns from the JSONL stores under `kernelforge/rag_store/`
+  (`optimization_patterns.jsonl`, `error_fixes.jsonl`, `hardware_constraints.jsonl`,
+  `knob_definitions.jsonl`, `research_insights.jsonl`) plus prior runs
+- Uses a seed-first Tritonization path: the first Triton step is constrained to a vetted GEMM1-only micro-kernel template while routing/SwiGLU/GEMM2 stay in PyTorch
 - Applies 1-2 constrained mutations (diff-based edits only)
 - Packs and benchmarks through existing starter-kit scripts
 - Caches benchmark outputs by kernel hash + benchmark flags
+- Preserves the baseline `kernel(...)` signature during validation so LLM edits do not silently break the entrypoint
 - Logs full provenance to:
   - `kernelforge/rag_store/runs.jsonl`
   - `kernelforge/provenance/runs.jsonl`
@@ -114,6 +119,96 @@ Run on Modal B200:
 ```bash
 python engine.py --mode modal --iters 10 --iterations 100 --num-trials 3
 ```
+
+Recommended Modal flow: preflight first, then full benchmark:
+
+1. Run preflight only (compile -> quick correctness -> sanitizer):
+
+```bash
+python - <<'PY'
+import json
+from kernelforge.benchmark import BenchSettings, PreflightSettings, run_preflight
+
+settings = BenchSettings(
+    mode="modal",
+    warmup_runs=1,
+    iterations=1,
+    num_trials=1,
+    workload_focus=None,
+)
+preflight = PreflightSettings(
+    enabled=True,
+    quick_workloads=3,
+    quick_warmup_runs=1,
+    quick_iterations=1,
+    quick_num_trials=1,
+    run_sanitizer=True,
+    sanitizer_workloads=1,
+    sanitizer_types=("memcheck",),
+)
+out = run_preflight(settings, preflight)
+print(json.dumps(out, indent=2))
+raise SystemExit(0 if out.get("ok") else 1)
+PY
+```
+
+2. If preflight passes, run full benchmark:
+
+```bash
+python - <<'PY'
+import json
+from kernelforge.benchmark import BenchSettings, run_benchmark
+
+settings = BenchSettings(
+    mode="modal",
+    warmup_runs=3,
+    iterations=100,
+    num_trials=3,
+    workload_focus=None,
+)
+out = run_benchmark(settings, phase="full")
+print(json.dumps(out["summary"], indent=2))
+PY
+```
+
+3. For optimization runs, keep preflight enabled so each iteration gates full benchmark:
+
+```bash
+python engine.py \
+  --mode modal \
+  --iters 10 \
+  --warmup-runs 3 \
+  --iterations 100 \
+  --num-trials 3 \
+  --preflight-quick-workloads 3 \
+  --preflight-sanitizer-workloads 1 \
+  --preflight-sanitizer-types memcheck
+```
+
+4. For correctness autofix loop (auto-repair until preflight passes, no full benchmark):
+
+```bash
+python engine.py \
+  --mode modal \
+  --iters 20 \
+  --model claude-sonnet-4-5-20250929 \
+  --warmup-runs 1 \
+  --iterations 1 \
+  --num-trials 1 \
+  --preflight-quick-workloads 3 \
+  --preflight-sanitizer-workloads 1 \
+  --preflight-sanitizer-types memcheck \
+  --autofix-correctness
+```
+
+Debugging failed autofix iterations:
+
+- LLM prompts/responses and patches are saved under `kernelforge/provenance/llm_logs/iter_XXX/attempt_YY/`:
+  - `generator_user_prompt.txt`
+  - `generator_raw_response.txt`
+  - `generator_patch.txt` (if patch mode)
+  - `generated_kernel.py`
+- Preflight failures now report workload-level details (workload id + max abs/rel error) in loop output.
 
 Optional: focus scoring on one workload during fast iteration:
 
@@ -148,14 +243,29 @@ Test your solution on NVIDIA B200 GPUs via Modal:
 ```bash
 modal setup
 modal volume create flashinfer-trace
-modal volume put flashinfer-trace /path/to/flashinfer-trace
+modal volume put flashinfer-trace /path/to/mlsys26-contest /mlsys26-contest
 ```
 
-**Run benchmark:**
+**Quickest single-workload run (recommended first):**
 
 ```bash
-modal run scripts/run_modal.py
+modal run scripts/run_modal.py \
+  --phase quick \
+  --warmup-runs 1 \
+  --iterations 1 \
+  --num-trials 1 \
+  --max-workloads 1 \
+  --stop-on-error
 ```
+
+**Compile-only smoke test:**
+
+```bash
+modal run scripts/run_modal.py --phase compile_only
+```
+
+If you uploaded the trace set somewhere else inside the Modal volume, pass
+`--trace-set-path /data/<your-path>`.
 
 ## Submission
 
@@ -286,6 +396,10 @@ Destination-passing style callable: expected xx parameters, but got xx
 ```
 
 This can happen for two reasons: (1) your kernel function signature has the wrong number of parameters, or (2) your kernel uses value-returning style but the solution still has `destination_passing_style` set to `true` by default. For the latter case, fix by setting `destination_passing_style` to `false`.
+
+In this repo, `scripts/pack_solution.py` now infers `destination_passing_style`
+from the `kernel(...)` return behavior when the config does not specify it, but
+explicitly setting it in `config.toml` is still the safest option.
 
 ### CUDA Kernel Bindings
 

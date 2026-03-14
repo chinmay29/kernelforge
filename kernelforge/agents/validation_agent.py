@@ -59,7 +59,9 @@ class ValidationAgent(Agent):
 
     def run(self, inputs: dict[str, Any]) -> AgentResult:
         source = str(inputs.get("source", ""))
-        report = self.validate(source)
+        baseline_source = inputs.get("baseline_source")
+        baseline = str(baseline_source) if baseline_source else None
+        report = self.validate(source, baseline_source=baseline)
         error = ""
         if not report.ok and report.first_failure:
             first = report.first_failure
@@ -67,7 +69,7 @@ class ValidationAgent(Agent):
             error = f"{first.name}{line_info}: {first.message}"
         return AgentResult(ok=report.ok, error=error, data=report.to_dict())
 
-    def validate(self, source: str) -> ValidationReport:
+    def validate(self, source: str, baseline_source: str | None = None) -> ValidationReport:
         checks: list[ValidationCheck] = []
         lines = source.splitlines()
 
@@ -84,8 +86,33 @@ class ValidationAgent(Agent):
         checks.append(self._check_return_statement(lines))
 
         if tree is not None:
+            checks.append(self._check_kernel_signature_stability(tree, baseline_source))
+            checks.append(self._check_seed_stage_scope(source, tree, baseline_source))
+            checks.append(self._check_seed_stage_numerics(source, tree, baseline_source))
             checks.append(self._check_global_access(tree))
+            checks.append(self._check_kernel_reachability(tree))
         else:
+            checks.append(
+                ValidationCheck(
+                    name="kernel_signature_stability",
+                    ok=False,
+                    message="Skipped because Python syntax is invalid.",
+                )
+            )
+            checks.append(
+                ValidationCheck(
+                    name="seed_stage_scope",
+                    ok=False,
+                    message="Skipped because Python syntax is invalid.",
+                )
+            )
+            checks.append(
+                ValidationCheck(
+                    name="seed_stage_numerics",
+                    ok=False,
+                    message="Skipped because Python syntax is invalid.",
+                )
+            )
             checks.append(
                 ValidationCheck(
                     name="triton_global_access",
@@ -93,7 +120,16 @@ class ValidationAgent(Agent):
                     message="Skipped because Python syntax is invalid.",
                 )
             )
+            checks.append(
+                ValidationCheck(
+                    name="kernel_reachability",
+                    ok=False,
+                    message="Skipped because Python syntax is invalid.",
+                )
+            )
 
+        checks.append(self._check_forbidden_baseline_calls(lines))
+        checks.append(self._check_non_trivial_compute(lines))
         checks.append(self._check_tl_dot_fp32(lines))
         checks.append(self._check_atomic_add(lines))
         checks.append(self._check_n_dimension_load_bounds(lines))
@@ -102,6 +138,201 @@ class ValidationAgent(Agent):
         checks.append(self._check_type_promotion(lines))
 
         return ValidationReport(ok=all(c.ok for c in checks), checks=checks)
+
+    @staticmethod
+    def _find_function(tree: ast.AST, fn_name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
+                return node
+        return None
+
+    @staticmethod
+    def _format_signature(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        parts: list[str] = []
+        posonly = [arg.arg for arg in fn.args.posonlyargs]
+        regular = [arg.arg for arg in fn.args.args]
+        kwonly = [arg.arg for arg in fn.args.kwonlyargs]
+
+        if posonly:
+            parts.extend(posonly)
+            parts.append("/")
+        parts.extend(regular)
+        if fn.args.vararg is not None:
+            parts.append(f"*{fn.args.vararg.arg}")
+        elif kwonly:
+            parts.append("*")
+        parts.extend(kwonly)
+        if fn.args.kwarg is not None:
+            parts.append(f"**{fn.args.kwarg.arg}")
+        return f"{fn.name}({', '.join(parts)})"
+
+    @staticmethod
+    def _signature_shape(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[Any, ...]:
+        return (
+            tuple(arg.arg for arg in fn.args.posonlyargs),
+            tuple(arg.arg for arg in fn.args.args),
+            fn.args.vararg.arg if fn.args.vararg is not None else None,
+            tuple(arg.arg for arg in fn.args.kwonlyargs),
+            fn.args.kwarg.arg if fn.args.kwarg is not None else None,
+            len(fn.args.defaults),
+            sum(1 for default in fn.args.kw_defaults if default is not None),
+        )
+
+    def _check_kernel_signature_stability(
+        self,
+        tree: ast.AST,
+        baseline_source: str | None,
+    ) -> ValidationCheck:
+        if not baseline_source:
+            return ValidationCheck(name="kernel_signature_stability", ok=True)
+
+        try:
+            baseline_tree = ast.parse(baseline_source)
+        except SyntaxError:
+            return ValidationCheck(name="kernel_signature_stability", ok=True)
+
+        current_fn = self._find_function(tree, "kernel")
+        baseline_fn = self._find_function(baseline_tree, "kernel")
+        if current_fn is None or baseline_fn is None:
+            return ValidationCheck(name="kernel_signature_stability", ok=True)
+
+        if self._signature_shape(current_fn) == self._signature_shape(baseline_fn):
+            return ValidationCheck(name="kernel_signature_stability", ok=True)
+
+        return ValidationCheck(
+            name="kernel_signature_stability",
+            ok=False,
+            message=(
+                "Do not change the entrypoint signature while optimizing the kernel. "
+                f"Expected `{self._format_signature(baseline_fn)}`, "
+                f"got `{self._format_signature(current_fn)}`."
+            ),
+            line=getattr(current_fn, "lineno", None),
+        )
+
+    def _check_seed_stage_scope(
+        self,
+        source: str,
+        tree: ast.AST,
+        baseline_source: str | None,
+    ) -> ValidationCheck:
+        if not baseline_source or "def _gemm1_subpath(" not in baseline_source:
+            return ValidationCheck(name="seed_stage_scope", ok=True)
+
+        try:
+            baseline_tree = ast.parse(baseline_source)
+        except SyntaxError:
+            return ValidationCheck(name="seed_stage_scope", ok=True)
+
+        baseline_jit = [
+            node.name
+            for node in ast.iter_child_nodes(baseline_tree)
+            if isinstance(node, ast.FunctionDef) and self._is_triton_jit(node)
+        ]
+        current_jit = [
+            node.name
+            for node in ast.iter_child_nodes(tree)
+            if isinstance(node, ast.FunctionDef) and self._is_triton_jit(node)
+        ]
+
+        if baseline_jit or not current_jit:
+            return ValidationCheck(name="seed_stage_scope", ok=True)
+
+        if current_jit != ["_gemm1_tile_kernel"]:
+            return ValidationCheck(
+                name="seed_stage_scope",
+                ok=False,
+                message=(
+                    "Seed-stage Tritonization may introduce only one Triton micro-kernel "
+                    "named `_gemm1_tile_kernel`."
+                ),
+            )
+
+        required_fragments = (
+            "def _gemm1_subpath(",
+            "G1 = _gemm1_subpath(A_e, W13_e)",
+            "C = torch.nn.functional.silu(X2) * X1",
+            "O = C.matmul(W2_e.t())",
+            "accum.index_add_(",
+            "_gemm1_tile_kernel[",
+        )
+        missing = [frag for frag in required_fragments if frag not in source]
+        if missing:
+            return ValidationCheck(
+                name="seed_stage_scope",
+                ok=False,
+                message=(
+                    "Seed-stage Tritonization must keep routing/SwiGLU/GEMM2/index_add_ "
+                    "in PyTorch and only replace `_gemm1_subpath(...)`. "
+                    f"Missing required fragment: `{missing[0]}`."
+                ),
+            )
+
+        return ValidationCheck(name="seed_stage_scope", ok=True)
+
+    def _check_seed_stage_numerics(
+        self,
+        source: str,
+        tree: ast.AST,
+        baseline_source: str | None,
+    ) -> ValidationCheck:
+        if not baseline_source or "def _gemm1_subpath(" not in baseline_source:
+            return ValidationCheck(name="seed_stage_numerics", ok=True)
+
+        try:
+            baseline_tree = ast.parse(baseline_source)
+        except SyntaxError:
+            return ValidationCheck(name="seed_stage_numerics", ok=True)
+
+        baseline_jit = [
+            node.name
+            for node in ast.iter_child_nodes(baseline_tree)
+            if isinstance(node, ast.FunctionDef) and self._is_triton_jit(node)
+        ]
+        current_jit = [
+            node.name
+            for node in ast.iter_child_nodes(tree)
+            if isinstance(node, ast.FunctionDef) and self._is_triton_jit(node)
+        ]
+        if baseline_jit or "_gemm1_tile_kernel" not in current_jit:
+            return ValidationCheck(name="seed_stage_numerics", ok=True)
+
+        kernel_fn = self._find_function(tree, "_gemm1_tile_kernel")
+        if kernel_fn is None:
+            return ValidationCheck(name="seed_stage_numerics", ok=True)
+
+        kernel_source = ast.get_source_segment(source, kernel_fn) or ""
+        if ".to(tl.bfloat16)" in kernel_source or ".to(tl.float16)" in kernel_source:
+            return ValidationCheck(
+                name="seed_stage_numerics",
+                ok=False,
+                message=(
+                    "Seed-stage GEMM1 already receives dequantized fp32 tensors. "
+                    "Do not downcast `_gemm1_tile_kernel` operands to bf16/fp16; "
+                    "keep loads in fp32 and use `tl.dot(..., input_precision=\"ieee\")` "
+                    "or equivalent fp32 accumulation."
+                ),
+                line=getattr(kernel_fn, "lineno", None),
+            )
+
+        if (
+            "tl.dot(" in kernel_source
+            and 'input_precision="ieee"' not in kernel_source
+            and "input_precision='ieee'" not in kernel_source
+        ):
+            return ValidationCheck(
+                name="seed_stage_numerics",
+                ok=False,
+                message=(
+                    "Seed-stage GEMM1 uses already-dequantized fp32 tensors. "
+                    "Request IEEE fp32 dot precision with "
+                    "`tl.dot(..., input_precision=\"ieee\")`, or use an equivalent "
+                    "explicit fp32 accumulation path."
+                ),
+                line=getattr(kernel_fn, "lineno", None),
+            )
+
+        return ValidationCheck(name="seed_stage_numerics", ok=True)
 
     def _check_syntax(self, source: str) -> tuple[ValidationCheck, ast.AST | None]:
         try:
@@ -212,6 +443,108 @@ class ValidationAgent(Agent):
         return ValidationCheck(name="triton_global_access", ok=True)
 
     @staticmethod
+    def _check_kernel_reachability(tree: ast.AST) -> ValidationCheck:
+        jit_funcs: set[str] = set()
+        top_level_fns: dict[str, ast.FunctionDef] = {}
+        kernel_fn: ast.FunctionDef | None = None
+
+        for node in ast.iter_child_nodes(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            top_level_fns[node.name] = node
+            if node.name == "kernel":
+                kernel_fn = node
+            if ValidationAgent._is_triton_jit(node):
+                jit_funcs.add(node.name)
+
+        if not jit_funcs:
+            if kernel_fn is not None and ValidationAgent._has_nontrivial_torch_compute(kernel_fn):
+                return ValidationCheck(
+                    name="kernel_reachability",
+                    ok=True,
+                    message="No Triton launch found, but a non-trivial PyTorch fallback path is present.",
+                    line=getattr(kernel_fn, "lineno", None),
+                    severity="warning",
+                )
+            return ValidationCheck(
+                name="kernel_reachability",
+                ok=False,
+                message="No @triton.jit kernel function detected.",
+            )
+        if kernel_fn is None:
+            return ValidationCheck(
+                name="kernel_reachability",
+                ok=False,
+                message="Missing entrypoint `def kernel(...)`.",
+            )
+
+        def _fn_has_launch(fn: ast.FunctionDef, visited: set[str]) -> bool:
+            if fn.name in visited:
+                return False
+            visited.add(fn.name)
+
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                call_fn = node.func
+                if isinstance(call_fn, ast.Subscript) and isinstance(call_fn.value, ast.Name):
+                    if call_fn.value.id in jit_funcs:
+                        return True
+                if isinstance(call_fn, ast.Name):
+                    callee = top_level_fns.get(call_fn.id)
+                    if callee is not None and _fn_has_launch(callee, visited):
+                        return True
+            return False
+
+        if _fn_has_launch(kernel_fn, set()):
+            return ValidationCheck(
+                name="kernel_reachability",
+                ok=True,
+            )
+
+        return ValidationCheck(
+            name="kernel_reachability",
+            ok=False,
+            message=(
+                "No reachable Triton launch found from `kernel(...)`. "
+                "Expected launch pattern like `my_kernel[grid](...)`."
+            ),
+            line=getattr(kernel_fn, "lineno", None),
+        )
+
+    @staticmethod
+    def _has_nontrivial_torch_compute(kernel_fn: ast.FunctionDef) -> bool:
+        heavy_ops = {"matmul", "mm", "bmm", "index_add_", "index_copy_", "scatter_add_"}
+        useful_ops = {
+            "topk",
+            "sigmoid",
+            "repeat_interleave",
+            "masked_fill",
+            "scatter_",
+            "permute",
+            "reshape",
+            "view",
+            "expand",
+            "silu",
+        }
+
+        seen_useful_ops: set[str] = set()
+        has_loop = any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(kernel_fn))
+        for node in ast.walk(kernel_fn):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if isinstance(fn, ast.Attribute):
+                if fn.attr in heavy_ops:
+                    return True
+                if fn.attr in useful_ops:
+                    seen_useful_ops.add(fn.attr)
+            elif isinstance(fn, ast.Name) and fn.id in useful_ops:
+                seen_useful_ops.add(fn.id)
+
+        return has_loop and len(seen_useful_ops) >= 2
+
+    @staticmethod
     def _is_triton_jit(fn: ast.FunctionDef) -> bool:
         for deco in fn.decorator_list:
             if isinstance(deco, ast.Attribute):
@@ -224,6 +557,58 @@ class ValidationAgent(Agent):
                 if "jit" in call_name.lower():
                     return True
         return False
+
+    @staticmethod
+    def _check_forbidden_baseline_calls(lines: list[str]) -> ValidationCheck:
+        forbidden_patterns = [
+            ("flashinfer_bench", "Calling FlashInfer-Bench internals from candidate kernel is disallowed."),
+            ("build_baseline(", "Direct baseline execution path is disallowed."),
+            ("baseline(", "Baseline helper invocation detected."),
+            ("torch.ops.flashinfer", "Direct FlashInfer operator invocation bypasses candidate kernel path."),
+            ("flashinfer.", "Direct FlashInfer runtime call detected; avoid baseline bypass."),
+        ]
+        for idx, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for pattern, message in forbidden_patterns:
+                if pattern in stripped:
+                    return ValidationCheck(
+                        name="forbidden_baseline_calls",
+                        ok=False,
+                        message=message,
+                        line=idx,
+                    )
+        return ValidationCheck(name="forbidden_baseline_calls", ok=True)
+
+    @staticmethod
+    def _check_non_trivial_compute(lines: list[str]) -> ValidationCheck:
+        suspicious_returns = [
+            "return torch.zeros",
+            "return torch.zeros_like",
+            "return hidden_states",
+            "return x",
+            "return input",
+        ]
+        has_triton_launch = any(
+            ("[" in line and "](" in line and "_kernel" in line)
+            for line in lines
+        )
+        for idx, line in enumerate(lines, start=1):
+            stripped = line.strip().replace(" ", "")
+            for marker in suspicious_returns:
+                marker_cmp = marker.replace(" ", "")
+                if marker_cmp in stripped and not has_triton_launch:
+                    return ValidationCheck(
+                        name="non_trivial_compute",
+                        ok=False,
+                        message=(
+                            "Detected trivial output path without a reachable kernel launch. "
+                            "Candidate must execute non-trivial compute."
+                        ),
+                        line=idx,
+                    )
+        return ValidationCheck(name="non_trivial_compute", ok=True)
 
     def _check_tl_dot_fp32(self, lines: list[str]) -> ValidationCheck:
         fp32_vars: set[str] = set()

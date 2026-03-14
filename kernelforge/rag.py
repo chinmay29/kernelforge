@@ -180,11 +180,25 @@ class RagStore:
 
     def get_error_fixes(self, error_text: str) -> list[dict[str, Any]]:
         """Find error fixes matching the given error text."""
-        return self.retrieve(
+        hits = self.retrieve(
             query=error_text,
             k=3,
             categories=["error_fixes"],
         )
+        if hits:
+            return hits
+
+        # Fallback: return high-signal correctness/runtime fixes so error-mode
+        # still provides guidance even when lexical overlap is weak.
+        data = self._load_all()
+        rows = data.get("error_fixes", [])
+        preferred = [
+            row for row in rows
+            if str(row.get("severity", "")).lower() in {"correctness", "runtime"}
+        ]
+        if preferred:
+            return preferred[:3]
+        return rows[:3]
 
     def get_patterns(
         self, query: str, tags: list[str] | None = None, k: int = 5,
