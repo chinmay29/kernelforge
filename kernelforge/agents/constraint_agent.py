@@ -44,6 +44,8 @@ class ConstraintAgent(Agent):
 
     _DOT_ARGS_RE = re.compile(r"tl\.dot\(([^,]+),\s*([^)]+)\)")
     _CAST_ASSIGN_RE = re.compile(r"(\w+)\s*=\s*.*\.to\(tl\.(?:float16|bfloat16)\)")
+    # Track FP8 casts — native FP8 tl.dot is valid on B200 (tcgen05.mma via Triton 3.2+)
+    _FP8_CAST_ASSIGN_RE = re.compile(r"(\w+)\s*=\s*.*\.to\(tl\.float8e4nv\)")
 
     def __init__(self, max_shared_mem_kb: int = 227) -> None:
         self.max_shared_mem_kb = max_shared_mem_kb
@@ -123,13 +125,17 @@ class ConstraintAgent(Agent):
         return []
 
     def _check_dot_operands(self, lines: list[str]) -> list[ConstraintViolation]:
-        casted_vars: set[str] = set()
+        casted_vars: set[str] = set()   # bf16/fp16 cast vars
+        fp8_vars: set[str] = set()      # float8e4nv cast vars — native FP8 GEMM on B200
         violations: list[ConstraintViolation] = []
 
         for line in lines:
             m = self._CAST_ASSIGN_RE.match(line.strip())
             if m:
                 casted_vars.add(m.group(1))
+            m8 = self._FP8_CAST_ASSIGN_RE.match(line.strip())
+            if m8:
+                fp8_vars.add(m8.group(1))
 
         for idx, line in enumerate(lines, start=1):
             stripped = line.strip()
@@ -141,26 +147,25 @@ class ConstraintAgent(Agent):
             arg1 = match.group(1).strip()
             arg2 = match.group(2).strip()
 
-            for arg in (arg1, arg2):
-                if "fp8" in arg.lower():
-                    violations.append(
-                        ConstraintViolation(
-                            constraint="fp8_dot_operand",
-                            severity="error",
-                            message="tl.dot does not support FP8 operands directly. Dequantize before tl.dot.",
-                            line=idx,
-                        )
-                    )
+            # NOTE: FP8 (float8e4nv) is natively supported in tl.dot on B200 via
+            # tcgen05.mma (Triton 3.2+). Do NOT flag FP8 operands as errors.
 
-            # Warning if neither arg appears to be explicitly cast/dequantized.
-            if arg1 not in casted_vars and arg2 not in casted_vars:
+            # Warn if neither operand has an explicit cast — FP8 and bf16/fp16
+            # casts both satisfy the dequantization requirement on B200.
+            dequant_ok = (
+                arg1 in casted_vars or arg2 in casted_vars
+                or arg1 in fp8_vars or arg2 in fp8_vars
+                # Accept naming conventions like a_fp8, w_gate_fp8, etc.
+                or "fp8" in arg1.lower() or "fp8" in arg2.lower()
+            )
+            if not dequant_ok:
                 violations.append(
                     ConstraintViolation(
                         constraint="dequantization_signal",
                         severity="warning",
                         message=(
-                            "No explicit cast/dequantization signal found for tl.dot operands on this line. "
-                            "Verify FP8 block-scale dequantization happens before dot."
+                            "No explicit FP8/bf16/fp16 cast signal found for tl.dot operands. "
+                            "Ensure operands are float8e4nv (native FP8 GEMM) or bf16/fp16 — not raw fp32."
                         ),
                         line=idx,
                     )
@@ -171,7 +176,7 @@ class ConstraintAgent(Agent):
                     ConstraintViolation(
                         constraint="tl_dot_fp32",
                         severity="error",
-                        message="tl.dot operands should not be tl.float32.",
+                        message="tl.dot operands must not be tl.float32 — use float8e4nv, fp16, or bf16.",
                         line=idx,
                     )
                 )

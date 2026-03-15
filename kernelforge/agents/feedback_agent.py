@@ -126,6 +126,29 @@ class FeedbackAgent(Agent):
                 ),
             )
 
+        if "grouped_gemm_template_alignment" in error.lower():
+            return Feedback(
+                analysis=(
+                    "The grouped FP8 attempt drifted away from the vetted architecture and "
+                    "reintroduced the older sorted-token Triton path."
+                ),
+                fix_instructions=(
+                    "Stay close to the grouped template. Use exactly these helper names: "
+                    "`NUM_SMS = 148`, `_sort_tokens`, `_grouped_gemm1_swiglu_kernel`, "
+                    "`_grouped_gemm2_kernel`, `sorted_ids`, `expert_starts`, `counts`, "
+                    "`tile_starts`. Do not emit `gemm1_kernel`, `gemm2_kernel`, "
+                    "`expert_ids_per_block`, or Python `token_expert_pairs` lists."
+                ),
+                code_example=(
+                    "sorted_ids, expert_starts, counts, tile_starts = _sort_tokens(\n"
+                    "    topk_idx, local_start, E_LOCAL, device\n"
+                    ")\n"
+                    "_grouped_gemm1_swiglu_kernel[(NUM_SMS,)](...)\n"
+                    "_grouped_gemm2_kernel[(NUM_SMS,)](...)\n"
+                    "accum.index_add_(0, sorted_ids.long(), flat_out * rw_sorted[:, None])"
+                ),
+            )
+
         if "incorrect_numerical" in error.lower() or "max_abs_error" in error.lower():
             return Feedback(
                 analysis=(

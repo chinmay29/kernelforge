@@ -89,6 +89,7 @@ class ValidationAgent(Agent):
             checks.append(self._check_kernel_signature_stability(tree, baseline_source))
             checks.append(self._check_seed_stage_scope(source, tree, baseline_source))
             checks.append(self._check_seed_stage_numerics(source, tree, baseline_source))
+            checks.append(self._check_grouped_gemm_template_alignment(source, baseline_source))
             checks.append(self._check_global_access(tree))
             checks.append(self._check_kernel_reachability(tree))
         else:
@@ -109,6 +110,13 @@ class ValidationAgent(Agent):
             checks.append(
                 ValidationCheck(
                     name="seed_stage_numerics",
+                    ok=False,
+                    message="Skipped because Python syntax is invalid.",
+                )
+            )
+            checks.append(
+                ValidationCheck(
+                    name="grouped_gemm_template_alignment",
                     ok=False,
                     message="Skipped because Python syntax is invalid.",
                 )
@@ -333,6 +341,138 @@ class ValidationAgent(Agent):
             )
 
         return ValidationCheck(name="seed_stage_numerics", ok=True)
+
+    def _check_grouped_gemm_template_alignment(
+        self,
+        source: str,
+        baseline_source: str | None,
+    ) -> ValidationCheck:
+        if not baseline_source:
+            return ValidationCheck(name="grouped_gemm_template_alignment", ok=True)
+
+        baseline_is_seed = (
+            "def _gemm1_subpath(" in baseline_source
+            and "@triton.jit" in baseline_source
+            and "for le in range(E_LOCAL)" in baseline_source
+        )
+        if not baseline_is_seed:
+            return ValidationCheck(name="grouped_gemm_template_alignment", ok=True)
+
+        grouped_markers = (
+            "def _sort_tokens(",
+            "_grouped_gemm1_swiglu_kernel",
+            "_grouped_gemm2_kernel",
+            "tile_starts",
+            "sorted_ids",
+        )
+        legacy_grouped_markers = (
+            "def gemm1_kernel(",
+            "def gemm2_kernel(",
+            "expert_ids_per_block",
+            "token_expert_pairs = []",
+        )
+        attempts_grouped = (
+            any(marker in source for marker in grouped_markers)
+            or any(marker in source for marker in legacy_grouped_markers)
+            or "for le in range(E_LOCAL)" not in source
+        )
+        if not attempts_grouped:
+            return ValidationCheck(name="grouped_gemm_template_alignment", ok=True)
+
+        required_fragments = (
+            "NUM_SMS = 148",
+            "def _sort_tokens(",
+            "sorted_ids",
+            "expert_starts",
+            "counts",
+            "tile_starts",
+            "_grouped_gemm1_swiglu_kernel",
+            "_grouped_gemm2_kernel",
+            "tl.float8e4nv",
+        )
+        for fragment in required_fragments:
+            if fragment not in source:
+                return ValidationCheck(
+                    name="grouped_gemm_template_alignment",
+                    ok=False,
+                    message=(
+                        "Grouped FP8 attempts must stay close to the vetted template. "
+                        f"Missing required fragment: `{fragment}`."
+                    ),
+                    line=self._line_for_fragment(source, fragment),
+                )
+
+        persistent_launch_markers = (
+            "_grouped_gemm1_swiglu_kernel[(NUM_SMS,)]",
+            "_grouped_gemm2_kernel[(NUM_SMS,)]",
+            "grid = (NUM_SMS,)",
+            "grid=(NUM_SMS,)",
+        )
+        if not any(marker in source for marker in persistent_launch_markers):
+            return ValidationCheck(
+                name="grouped_gemm_template_alignment",
+                ok=False,
+                message=(
+                    "Grouped FP8 attempts must use the persistent launch shape from the "
+                    "template: `grid=(NUM_SMS,)` with NUM_SMS=148."
+                ),
+            )
+
+        if not re.search(r"index_add_\(\s*0\s*,\s*sorted_ids\b", source):
+            return ValidationCheck(
+                name="grouped_gemm_template_alignment",
+                ok=False,
+                message=(
+                    "Grouped FP8 attempts must scatter grouped outputs back with "
+                    "`accum.index_add_(0, sorted_ids, ...)`."
+                ),
+                line=self._line_for_fragment(source, "index_add_("),
+            )
+
+        forbidden_fragments = {
+            "def gemm1_kernel(": (
+                "Do not fall back to the legacy sorted-token kernels `gemm1_kernel`/`gemm2_kernel`; "
+                "use `_grouped_gemm1_swiglu_kernel` and `_grouped_gemm2_kernel` exactly."
+            ),
+            "def gemm2_kernel(": (
+                "Do not fall back to the legacy sorted-token kernels `gemm1_kernel`/`gemm2_kernel`; "
+                "use `_grouped_gemm1_swiglu_kernel` and `_grouped_gemm2_kernel` exactly."
+            ),
+            "token_expert_pairs = []": (
+                "Avoid rebuilding token-expert lists in Python. Use `_sort_tokens(...)` from the "
+                "grouped template."
+            ),
+            "expert_ids_per_block": (
+                "Avoid legacy `expert_ids_per_block` dispatch. Use `expert_starts`, `counts`, and "
+                "`tile_starts` for persistent grouped GEMM scheduling."
+            ),
+            "W13_fp32 = gemm1_weights.to(torch.float32)": (
+                "Grouped FP8 attempts must not pre-dequantize all GEMM1 weights upfront."
+            ),
+            "W2_fp32 = gemm2_weights.to(torch.float32)": (
+                "Grouped FP8 attempts must not pre-dequantize all GEMM2 weights upfront."
+            ),
+            "for le in range(E_LOCAL)": (
+                "Grouped FP8 attempts must replace the per-expert Python loop with grouped dispatch."
+            ),
+        }
+        for fragment, message in forbidden_fragments.items():
+            if fragment in source:
+                return ValidationCheck(
+                    name="grouped_gemm_template_alignment",
+                    ok=False,
+                    message=message,
+                    line=self._line_for_fragment(source, fragment),
+                )
+
+        return ValidationCheck(name="grouped_gemm_template_alignment", ok=True)
+
+    @staticmethod
+    def _line_for_fragment(source: str, fragment: str) -> int | None:
+        for idx, line in enumerate(source.splitlines(), start=1):
+            if fragment in line:
+                return idx
+        return None
 
     def _check_syntax(self, source: str) -> tuple[ValidationCheck, ast.AST | None]:
         try:
@@ -612,11 +752,16 @@ class ValidationAgent(Agent):
 
     def _check_tl_dot_fp32(self, lines: list[str]) -> ValidationCheck:
         fp32_vars: set[str] = set()
+        fp8_vars: set[str] = set()  # float8e4nv — native FP8 on B200, valid in tl.dot
+        _FP8_CAST_RE = re.compile(r"(\w+)\s*=\s*.*\.to\(tl\.float8e4nv\)")
         for line in lines:
             stripped = line.strip()
             match = self._FP32_CAST_RE.match(stripped)
             if match:
                 fp32_vars.add(match.group(1))
+            fp8_match = _FP8_CAST_RE.match(stripped)
+            if fp8_match:
+                fp8_vars.add(fp8_match.group(1))
 
         for idx, line in enumerate(lines, start=1):
             stripped = line.strip()
@@ -634,7 +779,8 @@ class ValidationAgent(Agent):
                 arg1 = dot_match.group(1).strip()
                 arg2 = dot_match.group(2).strip()
                 for arg in (arg1, arg2):
-                    if arg in fp32_vars:
+                    # fp32 vars are wrong; fp8 vars (float8e4nv) are valid on B200
+                    if arg in fp32_vars and arg not in fp8_vars:
                         return ValidationCheck(
                             name="tl_dot_operand_dtype",
                             ok=False,
@@ -651,7 +797,12 @@ class ValidationAgent(Agent):
                 return ValidationCheck(
                     name="atomic_add_usage",
                     ok=False,
-                    message="Avoid tl.atomic_add for fp32 accumulation in this workload.",
+                    message=(
+                        "Avoid tl.atomic_add for fp32 accumulation. "
+                        "Instead write GEMM2 results to a flat buffer [N_pairs, H] indexed by "
+                        "sorted-pair position (no conflicts), then accumulate with PyTorch "
+                        "`accum.index_add_(0, sorted_tok_ids, flat_out * rw[:, None])`."
+                    ),
                     line=idx,
                 )
         return ValidationCheck(name="atomic_add_usage", ok=True)

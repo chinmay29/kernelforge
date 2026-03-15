@@ -437,50 +437,106 @@ class CoordinatorAgent:
 
     def _task_instruction(self, source: str, last_error: str) -> str:
         lowered = last_error.lower()
-        if "def _gemm1_subpath(" in source and "@triton.jit" not in source and not last_error:
+
+        has_per_expert_loop = "for le in range(E_LOCAL)" in source or "for le in range(" in source
+        has_pre_dequant_all = (
+            "W13_fp32 = gemm1_weights.to(torch.float32)" in source
+            or "torch.repeat_interleave(S13" in source
+        )
+        has_grouped_gemm = (
+            "sorted_ids" in source
+            and ("_grouped_gemm" in source or "tile_starts" in source)
+        )
+        has_fp8_dot = "tl.float8e4nv" in source or ".to(tl.float8e4nv)" in source
+
+        if has_per_expert_loop and not has_grouped_gemm:
             return (
-                "Use the vetted GEMM1-only Triton micro-kernel template. Replace only "
-                "`_gemm1_subpath(...)`; keep routing, SwiGLU, GEMM2, and final index_add_ "
-                "in PyTorch. Do not introduce more than one @triton.jit kernel in this attempt."
+                "PRIORITY 1 (biggest win): Replace the per-expert Python for-loop with "
+                "sort-then-grouped-GEMM. "
+                "Steps: (a) sort topk_ids by local expert id → sorted_ids [N_pairs], "
+                "expert_starts [E], counts [E], tile_starts [E+1]; "
+                "(b) launch `_grouped_gemm1_swiglu_kernel[(NUM_SMS,)]` with `grid=(148,)` "
+                "— persistent kernel loops over tiles across all experts; "
+                "(c) launch `_grouped_gemm2_kernel[(NUM_SMS,)]` similarly; "
+                "(d) gather routing weights in sorted order, write GEMM2 to flat buffer "
+                "[N_pairs, H], then `accum.index_add_(0, sorted_ids, flat_out * rw[:, None])`. "
+                "If the last attempt failed, fix that bug inside this grouped template rather "
+                "than returning to seed-stage `_gemm1_tile_kernel` tweaks. "
+                "Use the GROUPED_GEMM_FP8_TEMPLATE as your reference implementation, and "
+                "use the helper names exactly as shown there. Do not emit legacy "
+                "`gemm1_kernel`, `gemm2_kernel`, `expert_ids_per_block`, or Python "
+                "`token_expert_pairs` list-building."
             )
-        if (
-            "def _gemm1_subpath(" in source
-            and "@triton.jit" not in source
-            and ("incorrect_numerical" in lowered or "max_abs_error" in lowered)
-        ):
-            return (
-                "Fix only the seed-stage GEMM1 micro-kernel numerics. `_gemm1_subpath(...)` "
-                "already receives dequantized float32 tensors (`A_e`, `W13_e`), so do not "
-                "downcast them to bf16/fp16. Keep the Triton GEMM1 math in fp32 and use "
-                "`tl.dot(..., input_precision=\"ieee\")` or equivalent fp32 accumulation. "
-                "Keep routing, SwiGLU, GEMM2, and index_add_ unchanged in PyTorch."
-            )
+
+        # ── Error recovery: always fix errors before optimizing ──────────────
         if (
             "operation not supported on global/shared address space" in lowered
             or "acceleratorerror" in lowered
         ):
             return (
-                "Fix probable illegal memory access first: ensure all offs_n/offs_bn tail loads and stores are "
-                "N-bounded (`offs_n < N`) or safely wrapped with `% N`."
+                "Fix probable illegal memory access: ensure all offs_n/offs_bn tail loads and "
+                "stores are N-bounded (`offs_n < N`) or safely wrapped with `% N`. "
+                "If you are attempting grouped FP8, keep the vetted helper names exactly and "
+                "do not fall back to legacy `gemm1_kernel`/`gemm2_kernel` dispatch."
             )
         if "incorrect_numerical" in lowered or "max_abs_error" in lowered:
             return (
-                "Fix numerical correctness first. In sorted dispatch, ensure token-id vs pair-index semantics: "
-                "use token-id for hidden/routing tensors and offs_token_id for intermediates sized by num_tokens."
+                "Fix numerical correctness first. Common causes in grouped GEMM: "
+                "(1) token-id vs pair-index mixup — use tok_id (from sorted_ids) for "
+                "hidden_states/routing, pair-position for flat intermediate buffers; "
+                "(2) block-scale application — apply `acc *= a_scale[:, None] * w_scale[None, :]` "
+                "every 128 K-steps, not once at the end; "
+                "(3) SwiGLU gate/up ordering — gate is rows [0..I), up is rows [I..2I)."
             )
         if last_error:
             return (
                 "Fix the runtime/compile issue first with minimal edits. "
                 "Do not introduce broad rewrites in the same attempt."
             )
-        if self._iteration == 0:
+
+        # ── Seed stage: no @triton.jit yet ───────────────────────────────────
+        if "def _gemm1_subpath(" in source and "@triton.jit" not in source:
             return (
-                "Convert one high-impact GEMM path to Triton with correct FP8 dequantization, "
-                "and keep the rest stable."
+                "Use the vetted GEMM1-only Triton micro-kernel template. Replace only "
+                "`_gemm1_subpath(...)`; keep routing, SwiGLU, GEMM2, and final index_add_ "
+                "in PyTorch. Do not introduce more than one @triton.jit kernel in this attempt."
             )
+
+        # Priority 2 (saves ~93% memory traffic): Eliminate pre-dequantization
+        if has_pre_dequant_all and not has_fp8_dot:
+            return (
+                "PRIORITY 2: Eliminate pre-dequantization of all expert weights. "
+                "Remove the W13_fp32/W13/W2_fp32/W2 blocks that expand all 32 experts upfront. "
+                "Instead, inside the Triton kernel load FP8 weights directly and cast to "
+                "`tl.float8e4nv` before `tl.dot`. Apply block scales to the FP32 accumulator "
+                "every Q_BLOCK=128 K-steps: `acc = acc * a_scale[:, None] * w_scale[None, :]`. "
+                "Activation scale layout: hidden_states_scale[H//128, T] → load as "
+                "`tl.load(A_scale_ptr + k_blk * T + tok_ids)`. "
+                "Weight scale layout: gemm1_weights_scale[E, 2I//128, H//128]."
+            )
+
+        # Priority 3: Fuse SwiGLU into GEMM1 kernel (eliminate intermediate write)
+        if has_grouped_gemm and has_fp8_dot and "swiglu" not in source.lower():
+            return (
+                "PRIORITY 3: Fuse SwiGLU activation into the GEMM1 Triton kernel. "
+                "After computing the gate [0..I) and up [I..2I) accumulators, apply "
+                "`swiglu = silu(gate) * up` in registers before writing to the output buffer. "
+                "Output shape changes from [N_pairs, 2I] to [N_pairs, I]."
+            )
+
+        # Priority 4: Tile size and pipeline depth improvements
+        if self._iteration >= 2:
+            return (
+                "PRIORITY 4: Tune tile sizes and pipeline depth for B200. "
+                "Try BLOCK_M=128, BLOCK_N=128 or 256, BLOCK_K=64, num_stages=3, num_warps=8. "
+                "With FP8 (1 byte/elem): 3*(128*64 + 256*64)*1 = 73KB SMEM — within budget. "
+                "Also consider grouped launch ordering: sort tiles by expert for L2 reuse. "
+                "Add @triton.autotune over these configs."
+            )
+
         return (
-            "Apply one focused optimization that improves speed while preserving numerical correctness "
-            "and Triton constraints."
+            "Apply the next focused optimization: improve FP8 block-scale application, "
+            "memory access coalescing, or pipeline depth. Keep correctness intact."
         )
 
     def _detailed_error(self, last_error: str) -> str:

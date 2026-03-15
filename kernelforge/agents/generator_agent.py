@@ -13,24 +13,43 @@ from kernelforge.triton_templates import (
 )
 
 
-_SYSTEM_PROMPT = """You are a GPU kernel engineer writing Triton kernels for NVIDIA B200.
+_SYSTEM_PROMPT = """You are a GPU kernel engineer writing high-performance Triton kernels for NVIDIA B200.
 Generate valid Python source for `kernel.py`.
 
-Hard rules:
+## Architecture target
+The kernel implements a DeepSeek-V3/R1 MoE layer: routing → GEMM1 (gate+up proj) → SwiGLU → GEMM2.
+The goal is 2-4× speedup over the baseline through two structural changes:
+(A) Sort tokens by expert ID and run a single grouped GEMM instead of a per-expert loop.
+(B) Use native FP8 tl.dot (float8e4nv operands) with block-scale correction in the accumulator
+    instead of pre-dequantizing all expert weights upfront.
+
+## Hard rules
 1. Keep `def kernel(...)` as the callable entrypoint and preserve the exact baseline argument order.
 2. Use imports: torch, triton, triton.language as tl.
-3. FP8 dequantization must happen before tl.dot.
+3. **FP8 native GEMM**: On B200, `tl.dot` accepts `tl.float8e4nv` operands directly (maps to
+   tcgen05.mma). Do NOT pre-dequantize all expert weights — load FP8, call tl.dot, apply block
+   scales to the FP32 accumulator every BLOCK_K=128 step.
 4. Avoid type promotion bugs: fp16*fp32 and bf16*fp32 produce fp32; cast result back.
-5. Do not use tl.atomic_add for fp32 accumulation.
+5. Do not use tl.atomic_add for fp32 accumulation; write to a flat output buffer indexed by
+   sorted-pair position, then let PyTorch scatter_add_ / index_add_ accumulate back.
 6. Any `tl.load` / `tl.store` using `offs_n`/`offs_bn` must guard N-tail (`offs_n < N`) or use `% N`.
-7. CUDA async errors often surface late; treat tail-mask correctness as mandatory.
-8. In sorted-token kernels, use `offs_token` (token ids) only for original token tensors; use `offs_token_id` for intermediate tensors sized by `num_tokens`.
-9. Preserve the current return style unless you are explicitly fixing destination-passing style and the packaging/config will be updated too.
-10. If the baseline is pure PyTorch or hybrid, keep it working and extract only one focused region to Triton at a time.
-11. During seed-stage Tritonization, only replace `_gemm1_subpath(...)` using the provided `_gemm1_tile_kernel` template. Do not Tritonize routing, SwiGLU, GEMM2, or accumulation in the same attempt.
-12. In the seed-stage GEMM1 helper, `A_e` and `W13_e` are already dequantized float32 tensors. Do not downcast them to bf16/fp16 in the first Triton attempt; keep GEMM1 math in fp32 and use `input_precision="ieee"` when using `tl.dot`.
+7. CUDA async errors surface late; treat tail-mask correctness as mandatory.
+8. In sorted-token kernels: `tok_id` (loaded from sorted_ids) indexes original-token tensors
+   (hidden_states, routing_weights); `pos` (0..num_pairs-1) indexes intermediate flat buffers.
+9. Preserve the current return style.
+10. Tile sizes: prefer BLOCK_M=128, BLOCK_N=128 or 256, BLOCK_K=64. With FP8 (1 byte/elem) and
+    3 stages, 128×256×64 costs 3*(128*64 + 256*64)*1 = 73KB — well within B200's 228KB.
+11. Persistent grouped GEMM: use `grid=(NUM_SMS,)` where NUM_SMS=148 for B200. Each CTA loops
+    over tiles across all experts via a tile-to-expert mapping (cumulative tile offsets per expert).
+12. Block-scale application: apply `acc *= scale_a[:, None] * scale_b[None, :]` inside the K loop
+    every BLOCK_K=128 steps (DeepSeek-V3 block size is 128).
+13. If you attempt the grouped FP8 architecture, use the template helper names exactly:
+    `NUM_SMS = 148`, `_sort_tokens`, `_grouped_gemm1_swiglu_kernel`, `_grouped_gemm2_kernel`,
+    `sorted_ids`, `expert_starts`, `counts`, `tile_starts`.
+14. Do NOT emit the legacy sorted-token architecture names or patterns:
+    `gemm1_kernel`, `gemm2_kernel`, `expert_ids_per_block`, `token_expert_pairs`.
 
-Output mode:
+## Output mode
 - Preferred for all attempts: return a patch against the provided baseline source.
 - JSON keys: reasoning, mutation_name, patch.
 - Fallback allowed only when patching is impossible: return full file `source`.
@@ -244,28 +263,43 @@ class GeneratorAgent(Agent):
     def _runtime_safety_guards() -> str:
         return (
             "- Guard all N-tail loads/stores: if pointer math uses `offs_n` or `offs_bn`, include `offs_n < N` in mask.\n"
-            "- For FP8 block scales, dequantize before dot and keep dot operands non-fp32.\n"
+            "- FP8 native GEMM: cast tensors to tl.float8e4nv before tl.dot; accumulate in fp32; apply block scales every 128 K-steps.\n"
+            "- Block scales layout for hidden_states: scale[k_blk, tok_id] where k_blk = k_start // 128. Load with tl.load(scale_ptr + k_blk * T + tok_ids).\n"
+            "- Block scales layout for weights W13: scale[e, row_blk, col_blk]. Load per K-tile.\n"
             "- Prefer `% N` only when wraparound semantics are intended; otherwise explicit N mask is safer.\n"
-            "- For sorted token dispatch: token-id indexing for hidden_states/routing; pair-index (`offs_token_id`) indexing for num_tokens intermediates."
+            "- Sorted token dispatch: `tok_id = tl.load(sorted_ids_ptr + pos)` gives the original token index;\n"
+            "  use tok_id to index hidden_states/routing_weights; use pos (flat sort position) to index intermediate flat buffers.\n"
+            "- Do not use tl.atomic_add; write GEMM2 output to a flat buffer [N_pairs, H], then PyTorch index_add_ accumulates."
         )
 
     @staticmethod
     def _seed_template_context(source: str) -> str:
-        if "def _gemm1_subpath(" not in source or "@triton.jit" in source:
-            return ""
+        # Seed-stage (pure PyTorch, no @triton.jit yet): show the GEMM1-only template.
+        if "def _gemm1_subpath(" in source and "@triton.jit" not in source:
+            return (
+                "## Vetted Triton Micro-Kernel Template (GEMM1 only — seed stage)\n"
+                "Integration contract:\n"
+                f"{GEMM1_ONLY_NOTES}\n\n"
+                "```python\n"
+                f"{GEMM1_ONLY_TEMPLATE}\n"
+                "```\n\n"
+                f"The only new Triton kernel should be `{GEMM1_TEMPLATE_KERNEL_NAME}`.\n\n"
+            )
+        # Post-seed: baseline already has Triton JIT kernels. Show the full optimization target.
+        from kernelforge.triton_templates import GROUPED_GEMM_FP8_NOTES, GROUPED_GEMM_FP8_TEMPLATE
         return (
-            "## Vetted Triton Micro-Kernel Template (GEMM1 only)\n"
-            "Use this exact kernel name and integration shape for the first Triton step.\n"
-            "Keep routing, SwiGLU, GEMM2, and final accumulation in PyTorch.\n\n"
-            "Numerics note:\n"
-            "- `A_e` and `W13_e` are already dequantized float32 tensors before `_gemm1_subpath(...)`.\n"
-            "- For the seed-stage correctness pass, keep the Triton GEMM1 math in fp32.\n"
-            "- Do not downcast GEMM1 operands to bf16/fp16 before `tl.dot`; use `input_precision=\"ieee\"`.\n\n"
-            "Integration contract:\n"
-            f"{GEMM1_ONLY_NOTES}\n\n"
+            "## Optimization Target: Grouped FP8 GEMM Architecture\n"
+            "The baseline still has a per-expert Python loop and pre-dequantizes all weights.\n"
+            "Replace both with the sort-then-grouped-GEMM pattern shown below.\n"
+            "Use the helper/function names exactly as written in the template and keep the "
+            "persistent launch shape `grid=(NUM_SMS,)`.\n"
+            "Required names for grouped attempts: `NUM_SMS = 148`, `_sort_tokens`, "
+            "`_grouped_gemm1_swiglu_kernel`, `_grouped_gemm2_kernel`, `sorted_ids`, "
+            "`expert_starts`, `counts`, `tile_starts`.\n"
+            "Do not fall back to legacy `gemm1_kernel`/`gemm2_kernel` or "
+            "`expert_ids_per_block` dispatch.\n\n"
+            f"{GROUPED_GEMM_FP8_NOTES}\n\n"
             "```python\n"
-            f"{GEMM1_ONLY_TEMPLATE}\n"
+            f"{GROUPED_GEMM_FP8_TEMPLATE}\n"
             "```\n\n"
-            "Only change the GEMM1 subpath in this stage. "
-            f"The only new Triton kernel should be `{GEMM1_TEMPLATE_KERNEL_NAME}`.\n\n"
         )
