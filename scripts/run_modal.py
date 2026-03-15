@@ -13,6 +13,8 @@ Setup (one-time):
 import sys
 import json
 import os
+import tempfile
+import importlib.util
 from pathlib import Path
 
 # Add project root to path for imports
@@ -55,6 +57,43 @@ def _sanitize_output_to_status(output: object) -> tuple[str, str]:
     return "success", ""
 
 
+def _load_solution_entry_module(solution) -> tuple[object, str]:
+    temp_root = Path(tempfile.mkdtemp(prefix="kernelforge_solution_"))
+    for source in solution.sources:
+        dest = temp_root / source.path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(source.content, encoding="utf-8")
+
+    entry_path, _, entry_fn = solution.spec.entry_point.partition("::")
+    module_path = temp_root / entry_path
+    module_name = f"kernelforge_solution_{module_path.stem}"
+    sys.path.insert(0, str(temp_root))
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import solution entry module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, entry_fn
+
+
+def _normalize_call_inputs(inputs) -> tuple[tuple, dict]:
+    if isinstance(inputs, dict):
+        return (), dict(inputs)
+    if isinstance(inputs, (tuple, list)):
+        if len(inputs) == 1:
+            inner = inputs[0]
+            if isinstance(inner, dict):
+                return (), dict(inner)
+            if isinstance(inner, (tuple, list)):
+                return tuple(inner), {}
+        return tuple(inputs), {}
+    if hasattr(inputs, "args") or hasattr(inputs, "kwargs"):
+        args = tuple(getattr(inputs, "args", ()) or ())
+        kwargs = dict(getattr(inputs, "kwargs", {}) or {})
+        return args, kwargs
+    raise TypeError(f"Unsupported baseline.inputs type: {type(inputs)!r}")
+
+
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
 def run_benchmark(
     solution_json: str,
@@ -67,6 +106,10 @@ def run_benchmark(
     stop_on_error: bool = False,
     sanitizer_types: list[str] | None = None,
     sanitizer_timeout: int = 300,
+    grouped_mode: str = "full",
+    bypass_scales: bool = False,
+    max_k_tiles: int = 0,
+    native_fp8_gemm1: bool = True,
 ) -> dict:
     """Run benchmark on Modal B200 and return results.
 
@@ -80,6 +123,10 @@ def run_benchmark(
     from flashinfer_bench import BenchmarkConfig, Solution, TraceSet
     from flashinfer_bench.bench.evaluators import resolve_evaluator
     from flashinfer_bench.compile import get_builder_registry
+
+    os.environ["KF_USE_GROUPED_TRITON"] = "1" if grouped_mode == "full" else "0"
+    os.environ["KF_USE_GROUPED_TRITON_GEMM1_ONLY"] = "1" if grouped_mode == "gemm1_only" else "0"
+    os.environ["KF_USE_NATIVE_FP8_GEMM1"] = "1" if native_fp8_gemm1 else "0"
 
     solution = Solution.model_validate_json(solution_json)
     config = BenchmarkConfig(
@@ -192,6 +239,103 @@ def run_benchmark(
             pass
         return results
 
+    if phase in {
+        "debug_gemm1",
+        "debug_gemm1_preact",
+        "debug_gemm1_swiglu",
+        "debug_gemm2",
+        "debug_end_to_end",
+    }:
+        evaluator_cls = resolve_evaluator(definition)
+        module, _entry_fn = _load_solution_entry_module(solution)
+        debug_name = {
+            "debug_gemm1": "debug_grouped_gemm1_correctness_from_inputs",
+            "debug_gemm1_preact": "debug_grouped_gemm1_preactivation_from_inputs",
+            "debug_gemm1_swiglu": "debug_grouped_gemm1_swiglu_stages_from_inputs",
+            "debug_gemm2": "debug_grouped_gemm2_correctness_from_inputs",
+            "debug_end_to_end": "debug_grouped_end_to_end_components_from_inputs",
+        }[phase]
+        debug_fn = getattr(module, debug_name, None)
+        if debug_fn is None:
+            raise AttributeError(f"Solution entry module does not expose {debug_name}")
+
+        results = {definition.name: {}}
+        for wl_trace in workload_traces:
+            wl = wl_trace.workload
+            uuid_short = wl.uuid[:8]
+            try:
+                baseline = evaluator_cls.build_baseline(
+                    defn=definition,
+                    workload=wl,
+                    cfg=config,
+                    device=device,
+                    traceset_root=trace_root,
+                )
+                args, kwargs = _normalize_call_inputs(baseline.inputs)
+                if phase == "debug_gemm1_preact":
+                    kwargs["bypass_scales"] = bool(bypass_scales)
+                    kwargs["max_k_tiles"] = int(max_k_tiles)
+                report = debug_fn(*args, **kwargs)
+                results[definition.name][wl.uuid] = report
+                if phase == "debug_gemm1_preact":
+                    print(
+                        f"[run_modal] debug_gemm1_preact wl={uuid_short}: "
+                        f"ok={report.get('ok')} "
+                        f"x1_max_abs_error={report.get('x1_max_abs_error')} "
+                        f"x2_max_abs_error={report.get('x2_max_abs_error')} "
+                        f"bypass_scales={report.get('bypass_scales')} "
+                        f"max_k_tiles={report.get('max_k_tiles')}"
+                    )
+                elif phase == "debug_gemm1_swiglu":
+                    print(
+                        f"[run_modal] debug_gemm1_swiglu wl={uuid_short}: "
+                        f"ok={report.get('ok')} "
+                        f"fused_vs_reference={report.get('fused_vs_reference_max_abs_error')} "
+                        f"recomputed_vs_reference={report.get('recomputed_vs_reference_max_abs_error')} "
+                        f"fused_vs_recomputed={report.get('fused_vs_recomputed_max_abs_error')} "
+                        f"fused_vs_swapped_reference={report.get('fused_vs_swapped_reference_max_abs_error')}"
+                    )
+                elif phase == "debug_gemm2":
+                    print(
+                        f"[run_modal] debug_gemm2 wl={uuid_short}: "
+                        f"ok={report.get('ok')} "
+                        f"max_abs_error={report.get('max_abs_error')}"
+                    )
+                elif phase == "debug_end_to_end":
+                    print(
+                        f"[run_modal] debug_end_to_end wl={uuid_short}: "
+                        f"ok={report.get('ok')} "
+                        f"swiglu_fused_vs_reference={report.get('swiglu_fused_vs_reference_max_abs_error')} "
+                        f"gemm2_fused_vs_reference={report.get('gemm2_fused_vs_reference_max_abs_error')} "
+                        f"accum_fused_vs_reference={report.get('accum_fused_vs_reference_max_abs_error')} "
+                        f"final_bf16_fused_vs_reference={report.get('final_bf16_fused_vs_reference_max_abs_error')}"
+                    )
+                else:
+                    print(
+                        f"[run_modal] debug_gemm1 wl={uuid_short}: "
+                        f"ok={report.get('ok')} max_abs_error={report.get('max_abs_error')}"
+                    )
+                if stop_on_error and not report.get("ok", False):
+                    break
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[run_modal] {phase} wl={uuid_short}: ERROR: {e}")
+                print(f"[run_modal] Full traceback:\n{tb}")
+                results[definition.name][wl.uuid] = {
+                    "status": "runtime_error",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": tb,
+                }
+                if stop_on_error:
+                    break
+
+        try:
+            runnable.close()
+        except Exception:
+            pass
+        return results
+
     evaluator_cls = resolve_evaluator(definition)
     results = {definition.name: {}}
 
@@ -298,6 +442,10 @@ def main(
     sanitizer_types: str = "memcheck",
     sanitizer_timeout: int = 300,
     print_json: bool = False,
+    grouped_mode: str = "full",
+    bypass_scales: bool = False,
+    max_k_tiles: int = 0,
+    native_fp8_gemm1: bool = True,
 ):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
@@ -324,6 +472,10 @@ def main(
                 "stop_on_error": stop_on_error,
                 "sanitizer_types": sanitized_types,
                 "sanitizer_timeout": sanitizer_timeout,
+                "grouped_mode": grouped_mode,
+                "bypass_scales": bypass_scales,
+                "max_k_tiles": max_k_tiles,
+                "native_fp8_gemm1": native_fp8_gemm1,
             },
             indent=2,
         )
@@ -339,6 +491,10 @@ def main(
         stop_on_error=stop_on_error,
         sanitizer_types=sanitized_types or None,
         sanitizer_timeout=sanitizer_timeout,
+        grouped_mode=grouped_mode,
+        bypass_scales=bypass_scales,
+        max_k_tiles=max_k_tiles,
+        native_fp8_gemm1=native_fp8_gemm1,
     )
 
     if not results:
