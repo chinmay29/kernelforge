@@ -19,12 +19,17 @@ BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 128
 DOT_BLOCK_K = 64
+GEMM2_A_SCALE_BLOCK = DOT_BLOCK_K
+GROUPED_TILE_ORDER_GROUP = 8
 USE_GROUPED_TRITON = os.environ.get("KF_USE_GROUPED_TRITON", "1") == "1"
 USE_GROUPED_TRITON_GEMM1_ONLY = os.environ.get("KF_USE_GROUPED_TRITON_GEMM1_ONLY", "0") == "1"
 USE_NATIVE_FP8_GEMM1 = os.environ.get("KF_USE_NATIVE_FP8_GEMM1", "1") == "1"
+USE_NATIVE_FP8_GEMM2 = os.environ.get("KF_USE_NATIVE_FP8_GEMM2", "0") == "1"
+USE_BF16_GEMM2 = os.environ.get("KF_USE_BF16_GEMM2", "0") == "1"
+USE_GROUPED_TILE_ORDER = os.environ.get("KF_USE_GROUPED_TILE_ORDER", "1") == "1"
 
-DEFAULT_NUM_WARPS = 8
-DEFAULT_NUM_STAGES = 2
+DEFAULT_NUM_WARPS = int(os.environ.get("KF_NUM_WARPS", "8"))
+DEFAULT_NUM_STAGES = int(os.environ.get("KF_NUM_STAGES", "4"))
 
 # ----- Constants (DeepSeek-V3 / R1 geometry) -----
 H = 7168             # hidden_size
@@ -118,6 +123,84 @@ def _dequant_gemm2_weight(gemm2_weights, gemm2_weights_scale, expert_id):
     return w_fp32 * scale
 
 
+def _quantize_fp8_block_rows(x_fp32, block_size=BLOCK):
+    num_rows, width = x_fp32.shape
+    if num_rows == 0:
+        q = torch.empty_like(x_fp32, dtype=torch.float8_e4m3fn)
+        scale = torch.empty((width // block_size, 0), dtype=torch.float32, device=x_fp32.device)
+        return q, scale
+
+    x_blocks = x_fp32.view(num_rows, width // block_size, block_size)
+    absmax = x_blocks.abs().amax(dim=2)
+    scale = torch.where(
+        absmax > 0,
+        absmax / torch.finfo(torch.float8_e4m3fn).max,
+        torch.ones_like(absmax),
+    )
+    q = (x_blocks / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(num_rows, width)
+    return q.contiguous(), scale.transpose(0, 1).contiguous()
+
+
+def _dequant_fp8_block_rows(x_fp8, x_scale, block_size=BLOCK):
+    if x_fp8.numel() == 0:
+        return x_fp8.to(torch.float32)
+    scale = x_scale.transpose(0, 1).to(torch.float32)
+    return (x_fp8.to(torch.float32).view(-1, x_fp8.shape[1] // block_size, block_size) * scale.unsqueeze(-1)).reshape(
+        x_fp8.shape[0], x_fp8.shape[1]
+    )
+
+
+def _build_launch_tile_metadata(counts, tile_starts, tile_to_expert):
+    total_tiles = int(tile_to_expert.numel())
+    if total_tiles == 0:
+        empty = torch.empty((0,), dtype=torch.int32, device=counts.device)
+        return empty, empty
+
+    if (not USE_GROUPED_TILE_ORDER) or total_tiles <= NUM_SMS:
+        launch_tile_experts = tile_to_expert
+        launch_tile_offsets = (
+            torch.arange(total_tiles, dtype=torch.int32, device=counts.device)
+            - tile_starts.index_select(0, launch_tile_experts.to(torch.long))
+        ).to(torch.int32)
+        return launch_tile_experts, launch_tile_offsets
+
+    num_tiles = (counts + BLOCK_M - 1) // BLOCK_M
+    max_tiles = int(num_tiles.max().item())
+    if max_tiles == 0:
+        empty = torch.empty((0,), dtype=torch.int32, device=counts.device)
+        return empty, empty
+
+    group = GROUPED_TILE_ORDER_GROUP
+    num_chunks = (max_tiles + group - 1) // group
+    padded_tiles = num_chunks * group
+
+    expert_order = torch.argsort(num_tiles.to(torch.int64), descending=True, stable=True)
+    tile_offsets = torch.arange(padded_tiles, dtype=torch.int32, device=counts.device)
+    tile_offsets = tile_offsets.unsqueeze(0).expand(E_LOCAL, padded_tiles)
+    valid = tile_offsets < num_tiles.unsqueeze(1)
+
+    tile_offsets = tile_offsets.index_select(0, expert_order)
+    valid = valid.index_select(0, expert_order)
+    launch_tile_experts = expert_order.unsqueeze(1).expand(E_LOCAL, padded_tiles)
+
+    launch_tile_experts = (
+        launch_tile_experts.view(E_LOCAL, num_chunks, group)
+        .permute(1, 0, 2)
+        .reshape(-1)
+    )
+    launch_tile_offsets = (
+        tile_offsets.view(E_LOCAL, num_chunks, group)
+        .permute(1, 0, 2)
+        .reshape(-1)
+    )
+    valid = valid.view(E_LOCAL, num_chunks, group).permute(1, 0, 2).reshape(-1)
+
+    return (
+        launch_tile_experts[valid].to(torch.int32).contiguous(),
+        launch_tile_offsets[valid].to(torch.int32).contiguous(),
+    )
+
+
 @triton.jit
 def _grouped_gemm1_swiglu_kernel(
     A_ptr,
@@ -127,8 +210,8 @@ def _grouped_gemm1_swiglu_kernel(
     W13_scale_ptr,
     expert_starts_ptr,
     counts_ptr,
-    tile_starts_ptr,
-    tile_to_expert_ptr,
+    launch_tile_experts_ptr,
+    launch_tile_offsets_ptr,
     total_tiles,
     Out_ptr,
     stride_ah0,
@@ -158,11 +241,10 @@ def _grouped_gemm1_swiglu_kernel(
     tile_id = sm_id
 
     while tile_id < total_tiles:
-        expert_id = tl.load(tile_to_expert_ptr + tile_id)
-        expert_tile_start = tl.load(tile_starts_ptr + expert_id)
+        expert_id = tl.load(launch_tile_experts_ptr + tile_id)
         expert_start = tl.load(expert_starts_ptr + expert_id)
         expert_count = tl.load(counts_ptr + expert_id)
-        tile_in_expert = tile_id - expert_tile_start
+        tile_in_expert = tl.load(launch_tile_offsets_ptr + tile_id)
 
         offs_m = tile_in_expert * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < expert_count
@@ -268,8 +350,8 @@ def _grouped_gemm1_preact_kernel(
     W13_scale_ptr,
     expert_starts_ptr,
     counts_ptr,
-    tile_starts_ptr,
-    tile_to_expert_ptr,
+    launch_tile_experts_ptr,
+    launch_tile_offsets_ptr,
     total_tiles,
     X1_ptr,
     X2_ptr,
@@ -304,11 +386,10 @@ def _grouped_gemm1_preact_kernel(
     tile_id = sm_id
 
     while tile_id < total_tiles:
-        expert_id = tl.load(tile_to_expert_ptr + tile_id)
-        expert_tile_start = tl.load(tile_starts_ptr + expert_id)
+        expert_id = tl.load(launch_tile_experts_ptr + tile_id)
         expert_start = tl.load(expert_starts_ptr + expert_id)
         expert_count = tl.load(counts_ptr + expert_id)
-        tile_in_expert = tile_id - expert_tile_start
+        tile_in_expert = tl.load(launch_tile_offsets_ptr + tile_id)
 
         offs_m = tile_in_expert * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < expert_count
@@ -418,17 +499,20 @@ def _grouped_gemm1_preact_kernel(
 @triton.jit
 def _grouped_gemm2_kernel(
     A_ptr,
+    A_scale_ptr,
     sorted_ids_ptr,
     W2_ptr,
     W2_scale_ptr,
     expert_starts_ptr,
     counts_ptr,
-    tile_starts_ptr,
-    tile_to_expert_ptr,
+    launch_tile_experts_ptr,
+    launch_tile_offsets_ptr,
     total_tiles,
     Out_ptr,
     stride_am,
     stride_ak,
+    stride_as0,
+    stride_as1,
     stride_w2e,
     stride_w2n,
     stride_w2k,
@@ -444,17 +528,19 @@ def _grouped_gemm2_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     DOT_BLOCK_K: tl.constexpr,
+    A_SCALE_BLOCK: tl.constexpr,
+    USE_NATIVE_FP8_DOT: tl.constexpr,
+    USE_BF16_DOT: tl.constexpr,
 ):
     sm_id = tl.program_id(0)
     num_sms = tl.num_programs(0)
     tile_id = sm_id
 
     while tile_id < total_tiles:
-        expert_id = tl.load(tile_to_expert_ptr + tile_id)
-        expert_tile_start = tl.load(tile_starts_ptr + expert_id)
+        expert_id = tl.load(launch_tile_experts_ptr + tile_id)
         expert_start = tl.load(expert_starts_ptr + expert_id)
         expert_count = tl.load(counts_ptr + expert_id)
-        tile_in_expert = tile_id - expert_tile_start
+        tile_in_expert = tl.load(launch_tile_offsets_ptr + tile_id)
 
         offs_m = tile_in_expert * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < expert_count
@@ -480,27 +566,56 @@ def _grouped_gemm2_kernel(
                 for k_sub in range(0, BLOCK_K, DOT_BLOCK_K):
                     offs_k = k_start + k_sub + tl.arange(0, DOT_BLOCK_K)
                     mask_k = offs_k < I
+                    a_scale_blk = (k_start + k_sub) // A_SCALE_BLOCK
 
                     a_ptrs = A_ptr + pair_pos[:, None] * stride_am + offs_k[None, :] * stride_ak
-                    a_fp32 = tl.load(
-                        a_ptrs,
-                        mask=mask_m[:, None] & mask_k[None, :],
-                        other=0.0,
-                    ).to(tl.float32)
-
                     w_ptrs = (
                         W2_ptr
                         + expert_id * stride_w2e
                         + offs_k[:, None] * stride_w2k
                         + offs_n[None, :] * stride_w2n
                     )
-                    w_fp32 = tl.load(
-                        w_ptrs,
-                        mask=mask_k[:, None] & mask_n[None, :],
-                        other=0.0,
-                    ).to(tl.float32)
-
-                    acc += tl.dot(a_fp32, w_fp32, input_precision="ieee") * w_scale
+                    if USE_NATIVE_FP8_DOT:
+                        a_scale = tl.load(
+                            A_scale_ptr + a_scale_blk * stride_as0 + pair_pos * stride_as1,
+                            mask=mask_m,
+                            other=1.0,
+                        )
+                        a_fp8 = tl.load(
+                            a_ptrs,
+                            mask=mask_m[:, None] & mask_k[None, :],
+                            other=0.0,
+                        )
+                        w_fp8 = tl.load(
+                            w_ptrs,
+                            mask=mask_k[:, None] & mask_n[None, :],
+                            other=0.0,
+                        )
+                        acc += tl.dot(a_fp8, w_fp8) * a_scale[:, None] * w_scale
+                    elif USE_BF16_DOT:
+                        a_bf16 = tl.load(
+                            a_ptrs,
+                            mask=mask_m[:, None] & mask_k[None, :],
+                            other=0.0,
+                        ).to(tl.bfloat16)
+                        w_bf16 = tl.load(
+                            w_ptrs,
+                            mask=mask_k[:, None] & mask_n[None, :],
+                            other=0.0,
+                        ).to(tl.bfloat16)
+                        acc += tl.dot(a_bf16, w_bf16) * w_scale
+                    else:
+                        a_fp32 = tl.load(
+                            a_ptrs,
+                            mask=mask_m[:, None] & mask_k[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        w_fp32 = tl.load(
+                            w_ptrs,
+                            mask=mask_k[:, None] & mask_n[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        acc += tl.dot(a_fp32, w_fp32, input_precision="ieee") * w_scale
 
             out_ptrs = Out_ptr + pair_pos[:, None] * stride_om + offs_n[None, :] * stride_on
             tl.store(out_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
@@ -521,7 +636,12 @@ def _launch_grouped_gemm1_swiglu(
 ):
     num_pairs = int(sorted_ids.numel())
     out = torch.empty((num_pairs, I), dtype=torch.float32, device=hidden_states.device)
-    total_tiles = int(tile_starts[-1].item())
+    launch_tile_experts, launch_tile_offsets = _build_launch_tile_metadata(
+        counts,
+        tile_starts,
+        tile_to_expert,
+    )
+    total_tiles = int(launch_tile_experts.numel())
     if total_tiles == 0:
         return out
     dot_block_k = DOT_BLOCK_K
@@ -534,8 +654,8 @@ def _launch_grouped_gemm1_swiglu(
         gemm1_weights_scale,
         expert_starts,
         counts,
-        tile_starts,
-        tile_to_expert,
+        launch_tile_experts,
+        launch_tile_offsets,
         total_tiles,
         out,
         hidden_states.stride(0),
@@ -576,25 +696,44 @@ def _launch_grouped_gemm2(
     tile_to_expert,
 ):
     num_pairs = int(sorted_ids.numel())
-    swiglu_fp32 = swiglu_out.contiguous()
+    if USE_NATIVE_FP8_GEMM2:
+        swiglu_fp8, swiglu_scale = _quantize_fp8_block_rows(
+            swiglu_out.contiguous(),
+            block_size=GEMM2_A_SCALE_BLOCK,
+        )
+        swiglu_input = swiglu_fp8
+    elif USE_BF16_GEMM2:
+        swiglu_input = swiglu_out.to(torch.bfloat16).contiguous()
+        swiglu_scale = torch.empty((1, 1), dtype=torch.float32, device=swiglu_out.device)
+    else:
+        swiglu_input = swiglu_out.contiguous()
+        swiglu_scale = torch.empty((1, 1), dtype=torch.float32, device=swiglu_out.device)
     out = torch.empty((num_pairs, H), dtype=torch.float32, device=swiglu_out.device)
-    total_tiles = int(tile_starts[-1].item())
+    launch_tile_experts, launch_tile_offsets = _build_launch_tile_metadata(
+        counts,
+        tile_starts,
+        tile_to_expert,
+    )
+    total_tiles = int(launch_tile_experts.numel())
     if total_tiles == 0:
         return out
 
     _grouped_gemm2_kernel[(NUM_SMS,)](
-        swiglu_fp32,
+        swiglu_input,
+        swiglu_scale,
         sorted_ids,
         gemm2_weights,
         gemm2_weights_scale,
         expert_starts,
         counts,
-        tile_starts,
-        tile_to_expert,
+        launch_tile_experts,
+        launch_tile_offsets,
         total_tiles,
         out,
-        swiglu_fp32.stride(0),
-        swiglu_fp32.stride(1),
+        swiglu_input.stride(0),
+        swiglu_input.stride(1),
+        swiglu_scale.stride(0),
+        swiglu_scale.stride(1),
         gemm2_weights.stride(0),
         gemm2_weights.stride(1),
         gemm2_weights.stride(2),
@@ -610,6 +749,9 @@ def _launch_grouped_gemm2(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         DOT_BLOCK_K=DOT_BLOCK_K,
+        A_SCALE_BLOCK=GEMM2_A_SCALE_BLOCK,
+        USE_NATIVE_FP8_DOT=USE_NATIVE_FP8_GEMM2,
+        USE_BF16_DOT=USE_BF16_GEMM2,
         num_warps=DEFAULT_NUM_WARPS,
         num_stages=DEFAULT_NUM_STAGES,
     )
@@ -633,7 +775,12 @@ def _launch_grouped_gemm1_preact(
     num_pairs = int(sorted_ids.numel())
     x1_out = torch.empty((num_pairs, I), dtype=torch.float32, device=hidden_states.device)
     x2_out = torch.empty((num_pairs, I), dtype=torch.float32, device=hidden_states.device)
-    total_tiles = int(tile_starts[-1].item())
+    launch_tile_experts, launch_tile_offsets = _build_launch_tile_metadata(
+        counts,
+        tile_starts,
+        tile_to_expert,
+    )
+    total_tiles = int(launch_tile_experts.numel())
     if total_tiles == 0:
         return x1_out, x2_out
     dot_block_k = DOT_BLOCK_K
@@ -646,8 +793,8 @@ def _launch_grouped_gemm1_preact(
         gemm1_weights_scale,
         expert_starts,
         counts,
-        tile_starts,
-        tile_to_expert,
+        launch_tile_experts,
+        launch_tile_offsets,
         total_tiles,
         x1_out,
         x2_out,
@@ -1364,6 +1511,45 @@ def debug_grouped_gemm2_correctness(
         expert_starts,
         counts,
     )
+    swiglu_input_max_abs = float(swiglu_reference.abs().max().item()) if swiglu_reference.numel() else 0.0
+    bf16_activation_transform_max_abs_error = float(
+        (swiglu_reference.to(torch.bfloat16).to(torch.float32) - swiglu_reference)
+        .abs()
+        .max()
+        .item()
+    ) if swiglu_reference.numel() else 0.0
+    fp16_activation_transform_max_abs_error = float(
+        (swiglu_reference.to(torch.float16).to(torch.float32) - swiglu_reference)
+        .abs()
+        .max()
+        .item()
+    ) if swiglu_reference.numel() else 0.0
+    activation_transform_max_abs_error = 0.0
+    if USE_NATIVE_FP8_GEMM2:
+        swiglu_q, swiglu_q_scale = _quantize_fp8_block_rows(
+            swiglu_reference,
+            block_size=GEMM2_A_SCALE_BLOCK,
+        )
+        activation_transform_max_abs_error = float(
+            (
+                _dequant_fp8_block_rows(
+                    swiglu_q,
+                    swiglu_q_scale,
+                    block_size=GEMM2_A_SCALE_BLOCK,
+                )
+                - swiglu_reference
+            )
+            .abs()
+            .max()
+            .item()
+        )
+    elif USE_BF16_GEMM2:
+        activation_transform_max_abs_error = float(
+            (swiglu_reference.to(torch.bfloat16).to(torch.float32) - swiglu_reference)
+            .abs()
+            .max()
+            .item()
+        )
     candidate = _launch_grouped_gemm2(
         swiglu_reference,
         sorted_ids,
@@ -1410,6 +1596,10 @@ def debug_grouped_gemm2_correctness(
         "ok": torch.allclose(candidate, reference, atol=atol, rtol=rtol),
         "num_pairs": int(sorted_ids.numel()),
         "total_tiles": total_tiles,
+        "swiglu_input_max_abs": swiglu_input_max_abs,
+        "bf16_activation_transform_max_abs_error": bf16_activation_transform_max_abs_error,
+        "fp16_activation_transform_max_abs_error": fp16_activation_transform_max_abs_error,
+        "activation_transform_max_abs_error": activation_transform_max_abs_error,
         "max_abs_error": float(diff.max().item()) if diff.numel() else 0.0,
         "top_error_columns": _top_error_columns(diff),
         "mismatched_tiles": mismatched_tiles,
@@ -1727,11 +1917,11 @@ def kernel(
                 counts,
             )
 
+        sorted_ids_long = sorted_ids.to(torch.long)
         sorted_global_experts = sorted_local_experts.to(torch.long) + local_start
-        rw_sorted = weights[sorted_ids.to(torch.long), sorted_global_experts]
-
+        rw_sorted = weights[sorted_ids_long, sorted_global_experts]
         accum = torch.zeros((T, H), dtype=torch.float32, device=device)
-        accum.index_add_(0, sorted_ids.to(torch.long), gemm2_out * rw_sorted.unsqueeze(1))
+        accum.index_add_(0, sorted_ids_long, gemm2_out * rw_sorted.unsqueeze(1))
         return accum.to(torch.bfloat16)
 
     accum = torch.zeros((T, H), dtype=torch.float32, device=device)

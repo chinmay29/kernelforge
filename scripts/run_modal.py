@@ -110,6 +110,11 @@ def run_benchmark(
     bypass_scales: bool = False,
     max_k_tiles: int = 0,
     native_fp8_gemm1: bool = True,
+    grouped_tile_order: bool = True,
+    native_fp8_gemm2: bool = False,
+    bf16_gemm2: bool = False,
+    num_warps: int = 8,
+    num_stages: int = 4,
 ) -> dict:
     """Run benchmark on Modal B200 and return results.
 
@@ -127,6 +132,11 @@ def run_benchmark(
     os.environ["KF_USE_GROUPED_TRITON"] = "1" if grouped_mode == "full" else "0"
     os.environ["KF_USE_GROUPED_TRITON_GEMM1_ONLY"] = "1" if grouped_mode == "gemm1_only" else "0"
     os.environ["KF_USE_NATIVE_FP8_GEMM1"] = "1" if native_fp8_gemm1 else "0"
+    os.environ["KF_USE_GROUPED_TILE_ORDER"] = "1" if grouped_tile_order else "0"
+    os.environ["KF_USE_NATIVE_FP8_GEMM2"] = "1" if native_fp8_gemm2 else "0"
+    os.environ["KF_USE_BF16_GEMM2"] = "1" if bf16_gemm2 else "0"
+    os.environ["KF_NUM_WARPS"] = str(num_warps)
+    os.environ["KF_NUM_STAGES"] = str(num_stages)
 
     solution = Solution.model_validate_json(solution_json)
     config = BenchmarkConfig(
@@ -299,7 +309,8 @@ def run_benchmark(
                     print(
                         f"[run_modal] debug_gemm2 wl={uuid_short}: "
                         f"ok={report.get('ok')} "
-                        f"max_abs_error={report.get('max_abs_error')}"
+                        f"max_abs_error={report.get('max_abs_error')} "
+                        f"activation_transform_max_abs_error={report.get('activation_transform_max_abs_error')}"
                     )
                 elif phase == "debug_end_to_end":
                     print(
@@ -446,6 +457,11 @@ def main(
     bypass_scales: bool = False,
     max_k_tiles: int = 0,
     native_fp8_gemm1: bool = True,
+    grouped_tile_order: bool = True,
+    native_fp8_gemm2: bool = False,
+    bf16_gemm2: bool = False,
+    num_warps: int = 8,
+    num_stages: int = 4,
 ):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
@@ -476,6 +492,11 @@ def main(
                 "bypass_scales": bypass_scales,
                 "max_k_tiles": max_k_tiles,
                 "native_fp8_gemm1": native_fp8_gemm1,
+                "grouped_tile_order": grouped_tile_order,
+                "native_fp8_gemm2": native_fp8_gemm2,
+                "bf16_gemm2": bf16_gemm2,
+                "num_warps": num_warps,
+                "num_stages": num_stages,
             },
             indent=2,
         )
@@ -495,6 +516,11 @@ def main(
         bypass_scales=bypass_scales,
         max_k_tiles=max_k_tiles,
         native_fp8_gemm1=native_fp8_gemm1,
+        grouped_tile_order=grouped_tile_order,
+        native_fp8_gemm2=native_fp8_gemm2,
+        bf16_gemm2=bf16_gemm2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     if not results:
